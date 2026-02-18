@@ -302,6 +302,21 @@ def _line_similarity_key(text: str) -> str:
     )
 
 
+def _line_similarity_bucket(text: str) -> int:
+    similarity_key = _line_similarity_key(text)
+    return len(similarity_key) // 4
+
+
+def _iter_similarity_bucket_candidates(
+    bucket_to_lines: dict[int, list[str]],
+    text: str,
+) -> Iterator[str]:
+    base_bucket = _line_similarity_bucket(text)
+    for bucket in (base_bucket - 1, base_bucket, base_bucket + 1):
+        for candidate in bucket_to_lines.get(bucket, []):
+            yield candidate
+
+
 def _is_noise_line(text: str) -> bool:
     stripped_text = text.strip()
     if not stripped_text:
@@ -373,6 +388,7 @@ def _is_similar_line(a: str, b: str) -> bool:
 
 def _clean_ocr_lines(lines: list[str]) -> list[str]:
     cleaned_lines: list[str] = []
+    bucket_to_cleaned_lines: dict[int, list[str]] = {}
     seen_exact: set[str] = set()
     for line in lines:
         stripped_line = line.strip()
@@ -380,9 +396,15 @@ def _clean_ocr_lines(lines: list[str]) -> list[str]:
             continue
         if stripped_line in seen_exact:
             continue
-        if any(_is_similar_line(stripped_line, existing) for existing in cleaned_lines):
+        candidates = _iter_similarity_bucket_candidates(
+            bucket_to_cleaned_lines,
+            stripped_line,
+        )
+        if any(_is_similar_line(stripped_line, existing) for existing in candidates):
             continue
         cleaned_lines.append(stripped_line)
+        bucket = _line_similarity_bucket(stripped_line)
+        bucket_to_cleaned_lines.setdefault(bucket, []).append(stripped_line)
         seen_exact.add(stripped_line)
     return cleaned_lines
 
@@ -472,14 +494,21 @@ def _compute_page_quality_score_cached(normalized_text: str) -> float:
     line_count = len(page_lines)
     noise_count = sum(1 for line in page_lines if _is_noise_line(line))
     deduped_non_noise_lines: list[str] = []
+    deduped_bucket_to_lines: dict[int, list[str]] = {}
     duplicate_count = 0
     for line in page_lines:
         if _is_noise_line(line):
             continue
-        if any(_is_similar_line(line, existing) for existing in deduped_non_noise_lines):
+        dedupe_candidates = _iter_similarity_bucket_candidates(
+            deduped_bucket_to_lines,
+            line,
+        )
+        if any(_is_similar_line(line, existing) for existing in dedupe_candidates):
             duplicate_count += 1
             continue
         deduped_non_noise_lines.append(line)
+        bucket = _line_similarity_bucket(line)
+        deduped_bucket_to_lines.setdefault(bucket, []).append(line)
 
     confidence_ratio = min(
         1.0,
@@ -1037,10 +1066,21 @@ def _extract_page_raw_texts_with_ocr(
 
         if page_indices:
             render_dpis = OCR_WEAK_PAGE_PRESET_DPIS
+            weak_page_score_threshold = _resolve_key_content_min_page_score(
+                layout_mode=layout_mode,
+            )
         else:
             render_dpis = (OCR_MAX_DPI,)
+            weak_page_score_threshold = 0.0
 
-        for dpi in render_dpis:
+        for dpi_index, dpi in enumerate(render_dpis):
+            if dpi_index > 0 and page_indices:
+                should_retry = any(
+                    page_best_score.get(page_number, 0.0) < weak_page_score_threshold
+                    for page_number in range(first_page, last_page + 1)
+                )
+                if not should_retry:
+                    break
             try:
                 images = convert_from_path(
                     str(input_pdf),
@@ -2556,6 +2596,17 @@ def _execute_conversion(
 
     previous_progress_format = _active_progress_format
     _active_progress_format = progress_format_arg
+    conversion_started_at = time.monotonic()
+    stage_seconds: dict[str, float] = {
+        "native": 0.0,
+        "ocr": 0.0,
+        "postprocess": 0.0,
+        "write": 0.0,
+    }
+
+    def _format_stage_seconds(value: float) -> str:
+        return f"{max(0.0, value):.3f}"
+
     try:
         native_page_progress_writer = _build_page_progress_writer(
             stage_label="native page progress",
@@ -2564,12 +2615,15 @@ def _execute_conversion(
         )
         _write_progress(0, "starting conversion")
         _write_progress(15, "extracting native text")
+        native_started_at = time.monotonic()
         if chunk_size is not None and ocr_fallback_enabled:
             total_pages = _extract_page_count(input_pdf)
             if max_pages_arg is not None:
                 total_pages = min(total_pages, max(1, max_pages_arg))
+            stage_seconds["native"] = time.monotonic() - native_started_at
             _write_progress(35, f"native extraction complete pages={total_pages}")
-            return _run_split_before_ocr_conversion(
+            write_started_at = time.monotonic()
+            split_exit_code = _run_split_before_ocr_conversion(
                 input_pdf=input_pdf,
                 output_path=output_path,
                 total_pages=total_pages,
@@ -2587,15 +2641,29 @@ def _execute_conversion(
                 resource_guard_fail_open=resource_guard_fail_open,
                 progress_format=progress_format_arg,
             )
+            stage_seconds["write"] = time.monotonic() - write_started_at
+            total_seconds = time.monotonic() - conversion_started_at
+            _write_stderr_line(
+                "Diagnostics: mode=stage_timing "
+                f"native_seconds={_format_stage_seconds(stage_seconds['native'])} "
+                "ocr_seconds=0.000 "
+                "postprocess_seconds=0.000 "
+                f"write_seconds={_format_stage_seconds(stage_seconds['write'])} "
+                f"total_seconds={_format_stage_seconds(total_seconds)} "
+                "flow=split_before_ocr"
+            )
+            return split_exit_code
 
         page_texts = extract_page_texts(
             input_pdf,
             max_pages=max_pages_arg,
             progress_callback=native_page_progress_writer,
         )
+        stage_seconds["native"] = time.monotonic() - native_started_at
         _write_progress(35, f"native extraction complete pages={len(page_texts)}")
 
         if ocr_fallback_enabled:
+            ocr_started_at = time.monotonic()
             pipeline_result = _run_ocr_fallback_pipeline(
                 input_pdf=input_pdf,
                 page_texts=page_texts,
@@ -2607,12 +2675,14 @@ def _execute_conversion(
                 resource_guard_timeout_seconds=resource_guard_timeout_seconds_arg,
                 resource_guard_fail_open=resource_guard_fail_open,
             )
+            stage_seconds["ocr"] = time.monotonic() - ocr_started_at
             page_texts = pipeline_result.page_texts
             if pipeline_result.should_abort:
                 return 1
 
         if not _has_extractable_text(page_texts):
             _write_stderr_line(_no_extractable_text_warning(ocr_fallback_enabled))
+        postprocess_started_at = time.monotonic()
         if ocr_classical_zh_postprocess_arg:
             _write_progress(90, "applying classical chinese postprocess")
             postprocess_result = _apply_classical_zh_postprocess(page_texts)
@@ -2627,8 +2697,10 @@ def _execute_conversion(
             )
             page_texts = script_conversion_result[0]
             _write_stderr_line(script_conversion_result[1])
+        stage_seconds["postprocess"] = time.monotonic() - postprocess_started_at
 
         page_texts = [_normalize_page_text(page_text) for page_text in page_texts]
+        write_started_at = time.monotonic()
         if chunk_size is None:
             _write_progress(95, "writing markdown output")
             total_pages = max(1, len(page_texts))
@@ -2720,6 +2792,17 @@ def _execute_conversion(
                 100,
                 f"done output={output_base} chunk_total={chunk_total}",
             )
+        stage_seconds["write"] = time.monotonic() - write_started_at
+        total_seconds = time.monotonic() - conversion_started_at
+        _write_stderr_line(
+            "Diagnostics: mode=stage_timing "
+            f"native_seconds={_format_stage_seconds(stage_seconds['native'])} "
+            f"ocr_seconds={_format_stage_seconds(stage_seconds['ocr'])} "
+            f"postprocess_seconds={_format_stage_seconds(stage_seconds['postprocess'])} "
+            f"write_seconds={_format_stage_seconds(stage_seconds['write'])} "
+            f"total_seconds={_format_stage_seconds(total_seconds)} "
+            "flow=single_pass"
+        )
     except Exception as error:
         _write_stderr_line(_conversion_failed_message(error, input_pdf=input_pdf))
         return 1
