@@ -153,6 +153,7 @@ OCR_PDF2IMAGE_TIMEOUT_SECONDS = 120
 OCR_PDF2IMAGE_THREAD_COUNT_SINGLE_WORKER_CAP = 4
 OCR_PDF2IMAGE_USE_GRAYSCALE = True
 OCR_PDF2IMAGE_USE_PDFTOCAIRO = True
+OCR_SIMILARITY_MAX_BUCKET_CANDIDATES = 24
 OCR_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
 OCR_TRANSIENT_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (0.2, 0.5)
 ZH_SCRIPT_KEEP = "keep"
@@ -173,6 +174,7 @@ _RESOURCE_POLL_SECONDS = 0.2
 _RESOURCE_WAIT_HEARTBEAT_SECONDS = 5.0
 _RESOURCE_WAIT_MAX_SECONDS = 60.0
 _RESOURCE_WAIT_FAIL_OPEN = True
+_RESOURCE_GUARD_AUTO_FAIL_CLOSED_PAGE_THRESHOLD = 120
 _RESOURCE_GUARD_POLICY_FAIL_OPEN = "fail-open"
 _RESOURCE_GUARD_POLICY_FAIL_CLOSED = "fail-closed"
 _RESOURCE_GUARD_POLICY_CHOICES: tuple[str, ...] = (
@@ -181,6 +183,7 @@ _RESOURCE_GUARD_POLICY_CHOICES: tuple[str, ...] = (
 )
 _ocr_extractor_cache_enabled = False
 _OCR_EXTRACTOR_CACHE: dict[tuple[str, str, str], _ImageToString] = {}
+_PERF_REPORT_PATH_DEFAULT = Path("report/perf_last_run.md")
 
 _OCR_THRESHOLD_PROFILE_OVERRIDES: dict[str, dict[str, float]] = {
     "default": {},
@@ -312,9 +315,19 @@ def _iter_similarity_bucket_candidates(
     text: str,
 ) -> Iterator[str]:
     base_bucket = _line_similarity_bucket(text)
+    gathered: list[str] = []
     for bucket in (base_bucket - 1, base_bucket, base_bucket + 1):
-        for candidate in bucket_to_lines.get(bucket, []):
+        gathered.extend(bucket_to_lines.get(bucket, []))
+
+    if len(gathered) <= OCR_SIMILARITY_MAX_BUCKET_CANDIDATES:
+        for candidate in gathered:
             yield candidate
+        return
+
+    target_length = len(text)
+    ranked = sorted(gathered, key=lambda candidate: abs(len(candidate) - target_length))
+    for candidate in ranked[:OCR_SIMILARITY_MAX_BUCKET_CANDIDATES]:
+        yield candidate
 
 
 def _is_noise_line(text: str) -> bool:
@@ -369,8 +382,12 @@ def _is_similar_line(a: str, b: str) -> bool:
         if a_key == b_key:
             return True
         shorter_length = min(len(a_key), len(b_key))
+        longer_length = max(len(a_key), len(b_key))
         if shorter_length >= 5 and (a_key in b_key or b_key in a_key):
             return True
+
+        if shorter_length >= 8 and longer_length / max(1, shorter_length) >= 2.2:
+            return False
 
         key_similarity = SequenceMatcher(None, a_key, b_key).ratio()
         a_cjk, a_visible = _text_quality_score(a)
@@ -860,25 +877,55 @@ def _iter_selected_page_windows(
     yield from _yield_chunked_windows(run_start, run_end)
 
 
-def _build_rapidocr_runtime_params(*, extraction_workers: int) -> dict[str, object]:
+class _OcrRuntimeTuningProfile(TypedDict):
+    onnx_intra_op_threads: int
+    onnx_inter_op_threads: int
+    pdf2image_thread_count: int
+
+
+def _resolve_ocr_runtime_tuning_profile(*, extraction_workers: int) -> _OcrRuntimeTuningProfile:
+    cpu_count = os.cpu_count() or 1
     if extraction_workers <= 1:
-        return {}
+        return {
+            "onnx_intra_op_threads": max(1, min(4, cpu_count // 2 if cpu_count > 1 else 1)),
+            "onnx_inter_op_threads": 1,
+            "pdf2image_thread_count": max(
+                1,
+                min(cpu_count, OCR_PDF2IMAGE_THREAD_COUNT_SINGLE_WORKER_CAP),
+            ),
+        }
+
+    per_worker_cpu_budget = max(1, cpu_count // extraction_workers)
+    onnx_intra = max(1, min(2, per_worker_cpu_budget))
     return {
-        "EngineConfig.onnxruntime.intra_op_num_threads": 1,
-        "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+        "onnx_intra_op_threads": onnx_intra,
+        "onnx_inter_op_threads": 1,
+        "pdf2image_thread_count": 1,
+    }
+
+
+def _build_rapidocr_runtime_params(
+    *,
+    tuning_profile: _OcrRuntimeTuningProfile,
+) -> dict[str, object]:
+    return {
+        "EngineConfig.onnxruntime.intra_op_num_threads": tuning_profile[
+            "onnx_intra_op_threads"
+        ],
+        "EngineConfig.onnxruntime.inter_op_num_threads": tuning_profile[
+            "onnx_inter_op_threads"
+        ],
     }
 
 
 def _build_rapidocr_ocr_extractor(
     layout_mode: str = OCR_LAYOUT_AUTO,
     *,
-    extraction_workers: int = 1,
+    tuning_profile: _OcrRuntimeTuningProfile,
 ) -> _ImageToString:
     rapidocr_module = importlib.import_module("rapidocr_onnxruntime")
     rapidocr_cls = cast(Any, getattr(rapidocr_module, "RapidOCR"))
-    rapidocr_params = _build_rapidocr_runtime_params(
-        extraction_workers=extraction_workers
-    )
+    rapidocr_params = _build_rapidocr_runtime_params(tuning_profile=tuning_profile)
     rapidocr_engine = cast(object, rapidocr_cls(params=rapidocr_params))
 
     def _extract_box_metrics(box: object) -> tuple[float, float, float, float] | None:
@@ -979,11 +1026,8 @@ def _build_rapidocr_ocr_extractor(
     return _extract
 
 
-def _resolve_pdf2image_thread_count(*, extraction_workers: int) -> int:
-    if extraction_workers > 1:
-        return 1
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(cpu_count, OCR_PDF2IMAGE_THREAD_COUNT_SINGLE_WORKER_CAP))
+def _resolve_pdf2image_thread_count(*, tuning_profile: _OcrRuntimeTuningProfile) -> int:
+    return max(1, tuning_profile["pdf2image_thread_count"])
 
 
 def _extract_page_raw_texts_with_ocr(
@@ -1015,7 +1059,17 @@ def _extract_page_raw_texts_with_ocr(
     extraction_workers = _resolve_ocr_extraction_workers(
         window_count=len(windows), requested_workers=workers
     )
-    cache_key = (OCR_DEFAULT_ENGINE, layout_mode, str(extraction_workers > 1))
+    tuning_profile = _resolve_ocr_runtime_tuning_profile(
+        extraction_workers=extraction_workers,
+    )
+    cache_key = (
+        OCR_DEFAULT_ENGINE,
+        layout_mode,
+        (
+            f"intra={tuning_profile['onnx_intra_op_threads']}|"
+            f"inter={tuning_profile['onnx_inter_op_threads']}"
+        ),
+    )
     image_to_string: _ImageToString | None = None
     if _ocr_extractor_cache_enabled:
         image_to_string = _OCR_EXTRACTOR_CACHE.get(cache_key)
@@ -1023,13 +1077,16 @@ def _extract_page_raw_texts_with_ocr(
     if image_to_string is None:
         image_to_string = _build_rapidocr_ocr_extractor(
             layout_mode=layout_mode,
-            extraction_workers=extraction_workers,
+            tuning_profile=tuning_profile,
         )
         if _ocr_extractor_cache_enabled:
             _OCR_EXTRACTOR_CACHE[cache_key] = image_to_string
     pdf2image_thread_count = _resolve_pdf2image_thread_count(
-        extraction_workers=extraction_workers
+        tuning_profile=tuning_profile,
     )
+    if image_to_string is None:
+        raise RuntimeError("OCR extractor initialization failed")
+    resolved_image_to_string = image_to_string
 
     page_text_by_number: dict[int, str] = {}
     progress_total = len(page_indices) if page_indices else max(1, sum(last - first + 1 for first, last in windows))
@@ -1111,7 +1168,7 @@ def _extract_page_raw_texts_with_ocr(
                         image=images[image_offset],
                         dpi=dpi,
                     )
-                    candidate_text = image_to_string(candidate_image)
+                    candidate_text = resolved_image_to_string(candidate_image)
 
                 candidate_score = _compute_page_quality_score(candidate_text)
                 current_best_score = page_best_score.get(page_number)
@@ -2545,6 +2602,50 @@ def _resolve_ctl_options(
     )
 
 
+def _resolve_effective_resource_guard_fail_open(
+    *,
+    configured_fail_open: bool,
+    estimated_page_count: int,
+    ocr_enabled: bool,
+) -> bool:
+    if not configured_fail_open:
+        return False
+    if not ocr_enabled:
+        return True
+    return estimated_page_count < _RESOURCE_GUARD_AUTO_FAIL_CLOSED_PAGE_THRESHOLD
+
+
+def _write_performance_summary_report(
+    *,
+    flow: str,
+    output_target: str,
+    estimated_page_count: int,
+    stage_seconds: dict[str, float],
+) -> None:
+    report_path = Path.cwd() / _PERF_REPORT_PATH_DEFAULT
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    total_seconds = max(0.0, stage_seconds.get("total", 0.0))
+    page_per_second = (
+        (estimated_page_count / total_seconds)
+        if estimated_page_count > 0 and total_seconds > 0.0
+        else 0.0
+    )
+    report_lines = [
+        "# Performance Summary (Last Run)",
+        "",
+        f"- flow: {flow}",
+        f"- output_target: {output_target}",
+        f"- estimated_page_count: {estimated_page_count}",
+        f"- native_seconds: {stage_seconds.get('native', 0.0):.3f}",
+        f"- ocr_seconds: {stage_seconds.get('ocr', 0.0):.3f}",
+        f"- postprocess_seconds: {stage_seconds.get('postprocess', 0.0):.3f}",
+        f"- write_seconds: {stage_seconds.get('write', 0.0):.3f}",
+        f"- total_seconds: {total_seconds:.3f}",
+        f"- pages_per_second: {page_per_second:.3f}",
+    ]
+    _ = report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+
 def _execute_conversion(
     *,
     input_pdf_arg: str,
@@ -2572,7 +2673,6 @@ def _execute_conversion(
     ocr_auto_mode_enabled = ocr_mode_arg == OCR_MODE_AUTO
     ocr_fallback_enabled = ocr_fallback_arg or ocr_auto_mode_enabled
     ocr_strict_mode = ocr_fallback_arg
-    resource_guard_fail_open = resource_guard_policy_arg == _RESOURCE_GUARD_POLICY_FAIL_OPEN
 
     if progress_format_arg not in PROGRESS_FORMAT_CHOICES:
         raise RuntimeError(
@@ -2587,6 +2687,16 @@ def _execute_conversion(
     if not input_pdf.exists() or not input_pdf.is_file():
         _write_stderr_line(f"Input PDF not found: {input_pdf}")
         return 1
+
+    estimated_page_count = _extract_page_count(input_pdf)
+    if max_pages_arg is not None:
+        estimated_page_count = min(estimated_page_count, max(1, max_pages_arg))
+    configured_fail_open = resource_guard_policy_arg == _RESOURCE_GUARD_POLICY_FAIL_OPEN
+    resource_guard_fail_open = _resolve_effective_resource_guard_fail_open(
+        configured_fail_open=configured_fail_open,
+        estimated_page_count=estimated_page_count,
+        ocr_enabled=ocr_fallback_enabled,
+    )
 
     if chunk_size is None and output_path.exists() and not force_arg:
         _write_stderr_line(
@@ -2614,12 +2724,16 @@ def _execute_conversion(
             range_end=35,
         )
         _write_progress(0, "starting conversion")
+        _write_stderr_line(
+            "Diagnostics: mode=resource_guard "
+            f"configured_policy={resource_guard_policy_arg} "
+            f"resolved_policy={'fail-open' if resource_guard_fail_open else 'fail-closed'} "
+            f"estimated_pages={estimated_page_count}"
+        )
         _write_progress(15, "extracting native text")
         native_started_at = time.monotonic()
         if chunk_size is not None and ocr_fallback_enabled:
-            total_pages = _extract_page_count(input_pdf)
-            if max_pages_arg is not None:
-                total_pages = min(total_pages, max(1, max_pages_arg))
+            total_pages = estimated_page_count
             stage_seconds["native"] = time.monotonic() - native_started_at
             _write_progress(35, f"native extraction complete pages={total_pages}")
             write_started_at = time.monotonic()
@@ -2643,6 +2757,7 @@ def _execute_conversion(
             )
             stage_seconds["write"] = time.monotonic() - write_started_at
             total_seconds = time.monotonic() - conversion_started_at
+            stage_seconds["total"] = total_seconds
             _write_stderr_line(
                 "Diagnostics: mode=stage_timing "
                 f"native_seconds={_format_stage_seconds(stage_seconds['native'])} "
@@ -2652,6 +2767,17 @@ def _execute_conversion(
                 f"total_seconds={_format_stage_seconds(total_seconds)} "
                 "flow=split_before_ocr"
             )
+            try:
+                _write_performance_summary_report(
+                    flow="split_before_ocr",
+                    output_target=str(output_path),
+                    estimated_page_count=total_pages,
+                    stage_seconds=stage_seconds,
+                )
+            except Exception as report_error:
+                _write_stderr_line(
+                    f"Diagnostics: mode=perf_report status=failed error={report_error.__class__.__name__}"
+                )
             return split_exit_code
 
         page_texts = extract_page_texts(
@@ -2794,6 +2920,7 @@ def _execute_conversion(
             )
         stage_seconds["write"] = time.monotonic() - write_started_at
         total_seconds = time.monotonic() - conversion_started_at
+        stage_seconds["total"] = total_seconds
         _write_stderr_line(
             "Diagnostics: mode=stage_timing "
             f"native_seconds={_format_stage_seconds(stage_seconds['native'])} "
@@ -2803,6 +2930,17 @@ def _execute_conversion(
             f"total_seconds={_format_stage_seconds(total_seconds)} "
             "flow=single_pass"
         )
+        try:
+            _write_performance_summary_report(
+                flow="single_pass",
+                output_target=str(output_path),
+                estimated_page_count=max(1, len(page_texts)),
+                stage_seconds=stage_seconds,
+            )
+        except Exception as report_error:
+            _write_stderr_line(
+                f"Diagnostics: mode=perf_report status=failed error={report_error.__class__.__name__}"
+            )
     except Exception as error:
         _write_stderr_line(_conversion_failed_message(error, input_pdf=input_pdf))
         return 1
