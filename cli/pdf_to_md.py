@@ -181,6 +181,7 @@ _RESOURCE_GUARD_POLICY_CHOICES: tuple[str, ...] = (
     _RESOURCE_GUARD_POLICY_FAIL_OPEN,
     _RESOURCE_GUARD_POLICY_FAIL_CLOSED,
 )
+_DEFAULT_DOWNLOADS_DIR_NAME = "downloads"
 _ocr_extractor_cache_enabled = False
 _OCR_EXTRACTOR_CACHE: dict[tuple[str, str, str], _ImageToString] = {}
 _PERF_REPORT_PATH_DEFAULT = Path("report/perf_last_run.md")
@@ -1615,6 +1616,15 @@ def write_markdown_stream(output_path: Path, markdown_chunks: Iterable[str]) -> 
             _ = output_file.write(chunk)
 
 
+def _resolve_project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_default_output_path(input_pdf: Path) -> Path:
+    downloads_dir = _resolve_project_root() / _DEFAULT_DOWNLOADS_DIR_NAME / input_pdf.stem
+    return downloads_dir / f"{input_pdf.stem}.md"
+
+
 def _positive_int(value: str) -> int:
     parsed_value = int(value)
     if parsed_value <= 0:
@@ -2222,6 +2232,7 @@ def _write_chunk_markdown_file(
         resource_guard_timeout_seconds=resource_guard_timeout_seconds,
         resource_guard_fail_open=resource_guard_fail_open,
     )
+    chunk_output.parent.mkdir(parents=True, exist_ok=True)
     write_markdown_stream(chunk_output, [markdown_text])
     return markdown_text
 
@@ -2290,7 +2301,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = parser.add_argument(
         "-o",
         "--output",
-        help="Path to output markdown file (default: <input_stem>.md)",
+        help=(
+            "Path to output markdown file "
+            "(default: <project_root>/downloads/<input_stem>/<input_stem>.md)"
+        ),
     )
     split_group = parser.add_mutually_exclusive_group()
     _ = split_group.add_argument(
@@ -2515,13 +2529,16 @@ def _resolve_wizard_options(
 
     default_output = output_path
     if default_output is None and resolved_input_pdf:
-        default_output = str(Path(resolved_input_pdf).with_suffix(".md"))
+        default_output = str(_resolve_default_output_path(Path(resolved_input_pdf)))
 
     resolved_output = _prompt_text(
         (
             f"Output markdown path [{default_output}]: "
             if default_output
-            else "Output markdown path (blank for <input>.md): "
+            else (
+                "Output markdown path "
+                "(blank for <project_root>/downloads/<input_stem>/<input_stem>.md): "
+            )
         ),
         default_output,
     )
@@ -2555,12 +2572,15 @@ def _resolve_ctl_options(
 
     default_output = output_path
     if default_output is None and resolved_input_pdf:
-        default_output = str(Path(resolved_input_pdf).with_suffix(".md"))
+        default_output = str(_resolve_default_output_path(Path(resolved_input_pdf)))
     resolved_output = _prompt_text(
         (
             f"Output markdown path [{default_output}]: "
             if default_output
-            else "Output markdown path (blank for <input>.md): "
+            else (
+                "Output markdown path "
+                "(blank for <project_root>/downloads/<input_stem>/<input_stem>.md): "
+            )
         ),
         default_output,
     )
@@ -2681,7 +2701,7 @@ def _execute_conversion(
         )
 
     input_pdf = Path(input_pdf_arg)
-    output_path = Path(output_arg) if output_arg else input_pdf.with_suffix(".md")
+    output_path = Path(output_arg) if output_arg else _resolve_default_output_path(input_pdf)
     chunk_size = split_every_arg if split_every_arg is not None else split_preset_arg
 
     if not input_pdf.exists() or not input_pdf.is_file():
@@ -2703,6 +2723,9 @@ def _execute_conversion(
             f"Output file already exists: {output_path}. Use --force to overwrite."
         )
         return 1
+
+    if output_arg is None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     previous_progress_format = _active_progress_format
     _active_progress_format = progress_format_arg

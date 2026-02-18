@@ -26,6 +26,7 @@ _LEGACY_COMPAT_WARNING_MESSAGE = (
 _CONFIG_ENV_PATH = "PDF_TO_MD_CONFIG"
 _CONFIG_DEFAULT_NAME = ".pdf-to-md.json"
 _RESOURCE_DIR_NAME = "resource"
+_DEFAULT_DOWNLOADS_DIR_NAME = "downloads"
 _DELIVERY_IMMEDIATE = "immediate"
 _DELIVERY_BATCH = "batch"
 _OCR_DEPENDENCY_ACTION_ABORT = "abort"
@@ -745,6 +746,15 @@ def _discover_resource_pdfs() -> list[Path]:
     )
 
 
+def _resolve_project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_default_output_arg(input_pdf: Path) -> str:
+    output_dir = _resolve_project_root() / _DEFAULT_DOWNLOADS_DIR_NAME / input_pdf.stem
+    return str(output_dir / f"{input_pdf.stem}.md")
+
+
 def _resolve_chunk_output_base(output_path: Path, input_pdf: Path) -> Path:
     if output_path.exists() and output_path.is_dir():
         return output_path / input_pdf.stem
@@ -905,7 +915,7 @@ def _run_interactive_no_arg_launcher() -> int:
     )
     selected_pdf = resource_pdfs[selected_pdf_index]
 
-    default_output = f"{selected_pdf.stem}.md"
+    default_output = _resolve_default_output_arg(selected_pdf)
     output_value = _prompt_text(
         f"Output markdown path [{default_output}]: ",
         default_output,
@@ -1181,7 +1191,7 @@ def _resolve_output_arg(argv: list[str], input_pdf: Path) -> str:
             return token.split("=", 1)[1]
         if token == "--output" and index + 1 < len(argv):
             return argv[index + 1]
-    return f"{input_pdf.stem}.md"
+    return _resolve_default_output_arg(input_pdf)
 
 
 def _build_live_monitor_context_from_argv(
