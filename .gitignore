@@ -1,5 +1,11 @@
 report/
-resource/
 .sisyphus/
 output/
 downloads/
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.pdf-to-md.json

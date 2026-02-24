@@ -2724,8 +2724,7 @@ def _execute_conversion(
         )
         return 1
 
-    if output_arg is None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     previous_progress_format = _active_progress_format
     _active_progress_format = progress_format_arg

@@ -1,0 +1,7 @@
+pdfminer.six
+pdfplumber
+pypdf
+
+# Optional OCR runtime (for OCR modes)
+pdf2image
+rapidocr_onnxruntime

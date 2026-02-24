@@ -21,7 +21,7 @@ _HYBRID_COMMANDS: frozenset[str] = frozenset({"convert", "init", "config", "prof
 _LEGACY_COMPAT_WARNING_CLASS = "legacy-invocation"
 _LEGACY_COMPAT_WARNING_MESSAGE = (
     "DeprecationWarning: legacy invocation is supported in v1; "
-    "migrate to `pdf-to-md convert ...` before v2."
+    "migrate to `pdftomd convert ...` before v2."
 )
 _CONFIG_ENV_PATH = "PDF_TO_MD_CONFIG"
 _CONFIG_DEFAULT_NAME = ".pdf-to-md.json"
@@ -621,7 +621,7 @@ def _build_effective_state(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pdf-to-md",
+        prog="pdftomd",
         description="Hybrid CLI for PDF to Markdown conversion.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -908,18 +908,39 @@ def _run_interactive_no_arg_launcher() -> int:
         _write_stderr_line("No PDF files found in resource/. Add PDFs and re-run.")
         return 1
 
+    file_selection_options = [
+        f"Process all files in resource/ ({len(resource_pdfs)} files)",
+        *[pdf_path.name for pdf_path in resource_pdfs],
+    ]
     selected_pdf_index = _prompt_numbered_choice(
-        "Select PDF",
-        [pdf_path.name for pdf_path in resource_pdfs],
-        default_index=1,
+        "Select PDF or batch mode",
+        file_selection_options,
+        default_index=2,
     )
-    selected_pdf = resource_pdfs[selected_pdf_index]
+    selected_pdfs: list[Path]
+    output_by_pdf: dict[Path, str]
+    if selected_pdf_index == 0:
+        selected_pdfs = list(resource_pdfs)
+        default_output_root = _resolve_project_root() / _DEFAULT_DOWNLOADS_DIR_NAME
+        output_root_raw = _prompt_text(
+            f"Output base directory for all files [{default_output_root}]: ",
+            str(default_output_root),
+        )
+        output_root = Path(output_root_raw).expanduser()
+        output_by_pdf = {
+            pdf_path: str(output_root / pdf_path.stem / f"{pdf_path.stem}.md")
+            for pdf_path in selected_pdfs
+        }
+    else:
+        selected_pdf = resource_pdfs[selected_pdf_index - 1]
+        selected_pdfs = [selected_pdf]
+        default_output = _resolve_default_output_arg(selected_pdf)
+        output_value = _prompt_text(
+            f"Output markdown path [{default_output}]: ",
+            default_output,
+        )
+        output_by_pdf = {selected_pdf: output_value}
 
-    default_output = _resolve_default_output_arg(selected_pdf)
-    output_value = _prompt_text(
-        f"Output markdown path [{default_output}]: ",
-        default_output,
-    )
     force_enabled = _prompt_yes_no("Overwrite output if exists? [Y/n]: ", default=True)
 
     ocr_mode_index = _prompt_numbered_choice(
@@ -988,60 +1009,82 @@ def _run_interactive_no_arg_launcher() -> int:
         )
         delivery_mode = _DELIVERY_IMMEDIATE if delivery_index == 0 else _DELIVERY_BATCH
 
-    convert_argv: list[str] = [str(selected_pdf), "-o", output_value]
-    if force_enabled:
-        convert_argv.append("--force")
-    if ocr_mode == "strict":
-        convert_argv.append("--ocr-fallback")
-    elif ocr_mode == "auto":
-        convert_argv.extend(["--ocr", "auto"])
-    if ocr_mode in {"strict", "auto"}:
-        convert_argv.extend(["--ocr-engine", ocr_engine, "--ocr-layout", ocr_layout])
-    if classical_postprocess:
-        convert_argv.append("--ocr-classical-zh-postprocess")
-    if key_content_fallback:
-        convert_argv.append("--ocr-key-content-fallback")
-    convert_argv.extend(split_args)
-
-    _write_stderr_line("Starting conversion with interactive selection...")
-    global _live_monitor_context
-    previous_context = _live_monitor_context
-    _live_monitor_context = _LiveMonitorContext(
-        input_pdf=selected_pdf,
-        output_arg=output_value,
-        split_selected=split_selected,
-        delivery_mode=delivery_mode,
-        execution_mode_hint=_infer_execution_mode_hint(convert_argv),
-        progress_detail=_PROGRESS_DETAIL_VERBOSE,
-        progress_interval_seconds=_PROGRESS_INTERVAL_DEFAULT_SECONDS,
-    )
-    try:
-        exit_code = _invoke_legacy_main(convert_argv)
-    finally:
-        _live_monitor_context = previous_context
-    if exit_code != 0:
-        return exit_code
-
-    if split_selected:
-        chunk_paths = _resolve_generated_chunk_paths(
-            output_arg=output_value,
-            input_pdf=selected_pdf,
+    if len(selected_pdfs) == 1:
+        _write_stderr_line("Starting conversion with interactive selection...")
+    else:
+        _write_stderr_line(
+            f"Starting batch conversion for {len(selected_pdfs)} files from resource/..."
         )
-        if delivery_mode == _DELIVERY_BATCH:
-            bundle_path = _write_chunk_bundle(
+
+    global _live_monitor_context
+    failed_files: list[tuple[Path, int]] = []
+    for pdf_path in selected_pdfs:
+        output_value = output_by_pdf[pdf_path]
+        convert_argv: list[str] = [str(pdf_path), "-o", output_value]
+        if force_enabled:
+            convert_argv.append("--force")
+        if ocr_mode == "strict":
+            convert_argv.append("--ocr-fallback")
+        elif ocr_mode == "auto":
+            convert_argv.extend(["--ocr", "auto"])
+        if ocr_mode in {"strict", "auto"}:
+            convert_argv.extend(["--ocr-engine", ocr_engine, "--ocr-layout", ocr_layout])
+        if classical_postprocess:
+            convert_argv.append("--ocr-classical-zh-postprocess")
+        if key_content_fallback:
+            convert_argv.append("--ocr-key-content-fallback")
+        convert_argv.extend(split_args)
+
+        _write_stderr_line(f"Converting: {pdf_path.name}")
+        previous_context = _live_monitor_context
+        _live_monitor_context = _LiveMonitorContext(
+            input_pdf=pdf_path,
+            output_arg=output_value,
+            split_selected=split_selected,
+            delivery_mode=delivery_mode,
+            execution_mode_hint=_infer_execution_mode_hint(convert_argv),
+            progress_detail=_PROGRESS_DETAIL_VERBOSE,
+            progress_interval_seconds=_PROGRESS_INTERVAL_DEFAULT_SECONDS,
+        )
+        try:
+            exit_code = _invoke_legacy_main(convert_argv)
+        finally:
+            _live_monitor_context = previous_context
+
+        if exit_code != 0:
+            failed_files.append((pdf_path, exit_code))
+            _write_stderr_line(f"Failed: {pdf_path} (exit_code={exit_code})")
+            continue
+
+        if split_selected:
+            chunk_paths = _resolve_generated_chunk_paths(
                 output_arg=output_value,
-                input_pdf=selected_pdf,
-                chunk_paths=chunk_paths,
+                input_pdf=pdf_path,
             )
-            _write_stderr_line(
-                f"Batch bundle ready: {bundle_path} (chunk_count={len(chunk_paths)})"
-            )
-        else:
-            _write_stderr_line(
-                f"Split files ready immediately (count={len(chunk_paths)}):"
-            )
-            for chunk_path in chunk_paths:
-                _write_stderr_line(f"- {chunk_path}")
+            if delivery_mode == _DELIVERY_BATCH:
+                bundle_path = _write_chunk_bundle(
+                    output_arg=output_value,
+                    input_pdf=pdf_path,
+                    chunk_paths=chunk_paths,
+                )
+                _write_stderr_line(
+                    f"Batch bundle ready for {pdf_path.name}: {bundle_path} (chunk_count={len(chunk_paths)})"
+                )
+            else:
+                _write_stderr_line(
+                    f"Split files ready immediately for {pdf_path.name} (count={len(chunk_paths)}):"
+                )
+                for chunk_path in chunk_paths:
+                    _write_stderr_line(f"- {chunk_path}")
+
+    if failed_files:
+        _write_stderr_line("Batch conversion completed with failures:")
+        for failed_pdf, code in failed_files:
+            _write_stderr_line(f"- {failed_pdf}: exit_code={code}")
+        if len(selected_pdfs) == 1:
+            return failed_files[0][1]
+        return 1
+
     return 0
 
 
@@ -1447,10 +1490,12 @@ def _invoke_legacy_main_with_live_monitor(argv: list[str], context: _LiveMonitor
         exit_code = 130
     finally:
         watchdog_timer.cancel()
-        if process.poll() is None:
+        process_poll = getattr(process, "poll", None)
+        if callable(process_poll) and process_poll() is None:
             _terminate_child_process(reason="monitor cleanup")
-        if process.stderr is not None:
-            process.stderr.close()
+        process_stderr = getattr(process, "stderr", None)
+        if process_stderr is not None and hasattr(process_stderr, "close"):
+            process_stderr.close()
 
     elapsed = time.monotonic() - start_time
     _write_stderr_line(
