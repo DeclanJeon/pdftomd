@@ -2,6 +2,7 @@ report/
 .sisyphus/
 output/
 downloads/
+resource/
 .venv/
 __pycache__/
 *.pyc
