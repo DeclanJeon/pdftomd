@@ -106,7 +106,9 @@ WIZARD_IMPLEMENTED_OCR_ENGINES: tuple[str, ...] = ("rapidocr",)
 
 PDFPLUMBER_TRIGGER_MIN_CHAR_COUNT = 20
 PDFPLUMBER_TRIGGER_MIN_PRINTABLE_RATIO = 0.85
-PDFPLUMBER_MAX_PAGES_PER_DOCUMENT = 8
+PDFPLUMBER_MAX_PAGES_PER_DOCUMENT = 8  # DEPRECATED: pdfplumber now primary extractor
+
+
 
 OCR_DEFAULT_ENGINE = "rapidocr"
 OCR_PAGE_WINDOW_SIZE = 2
@@ -811,16 +813,39 @@ def _extract_page_raw_texts(
     max_pages: int | None = None,
     progress_callback: _PageProgressCallback | None = None,
 ) -> list[str]:
+    resolved_page_count = page_count if page_count and page_count > 0 else _extract_page_count(input_pdf)
+    if max_pages is not None:
+        resolved_page_count = min(resolved_page_count, max(1, max_pages))
+    
+    # Try pdfplumber first (primary)
+    try:
+        pdfplumber = importlib.import_module("pdfplumber")
+        pdfplumber_open = cast(_PdfPlumberOpen, getattr(pdfplumber, "open"))
+        
+        page_texts: list[str] = []
+        with pdfplumber_open(str(input_pdf)) as pdf_document:
+            for page_number in range(min(resolved_page_count, len(pdf_document.pages))):
+                page = pdf_document.pages[page_number]
+                extracted_text = page.extract_text(layout=True)
+                page_texts.append(extracted_text or "")
+                if progress_callback is not None:
+                    progress_callback(page_number + 1, resolved_page_count)
+        
+        # Check if extraction was successful (not all empty)
+        if any(page_texts) or not any(pt.strip() for pt in page_texts):
+            return page_texts
+    except Exception as pdfplumber_error:
+        _write_stderr_line(f"pdfplumber extraction failed: {pdfplumber_error}")
+    
+    # Fallback to pdfminer if pdfplumber failed
+    _write_stderr_line("Falling back to pdfminer.six for text extraction...")
     high_level = importlib.import_module("pdfminer.high_level")
     layout = importlib.import_module("pdfminer.layout")
     extract_pages = cast(_ExtractPages, getattr(high_level, "extract_pages"))
     lt_text_container = cast(type[object], getattr(layout, "LTTextContainer"))
-
-    resolved_page_count = page_count if page_count and page_count > 0 else _extract_page_count(input_pdf)
-    if max_pages is not None:
-        resolved_page_count = min(resolved_page_count, max(1, max_pages))
-    page_layouts = extract_pages(str(input_pdf), maxpages=resolved_page_count)
+    
     page_texts: list[str] = []
+    page_layouts = extract_pages(str(input_pdf), maxpages=resolved_page_count)
     for page_number, page_layout in enumerate(page_layouts, start=1):
         buffer = io.StringIO()
         for element in page_layout:
@@ -2271,7 +2296,7 @@ def _apply_selective_pdfplumber_route(
     weak_page_indices = [
         index for index, page_text in enumerate(page_texts) if _is_weak_page_text(page_text)
     ]
-    selected_indices = weak_page_indices[:PDFPLUMBER_MAX_PAGES_PER_DOCUMENT]
+    selected_indices = weak_page_indices  # Removed limit: pdfplumber now primary extractor
     if not selected_indices:
         return page_texts
 

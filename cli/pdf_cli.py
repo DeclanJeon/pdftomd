@@ -735,7 +735,24 @@ def _prompt_numbered_choice(
         _write_stderr_line(f"Invalid selection '{selected}'. Choose 1-{len(options)}.")
 
 
-def _discover_resource_pdfs() -> list[Path]:
+def _discover_pdfs_for_interactive() -> list[Path]:
+    # 1. First, search in current working directory (CWD)
+    cwd_pdfs = sorted(
+        [path for path in Path.cwd().iterdir() if path.is_file() and path.suffix.lower() == ".pdf"],
+        key=lambda path: path.name.lower(),
+    )
+    if cwd_pdfs:
+        return cwd_pdfs
+    
+    # 2. Fallback to resource folder (for development/testing)
+    project_root = Path(__file__).resolve().parents[1]
+    resource_dir = project_root / _RESOURCE_DIR_NAME
+    if not resource_dir.exists() or not resource_dir.is_dir():
+        return []
+    return sorted(
+        [path for path in resource_dir.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"],
+        key=lambda path: path.name.lower(),
+    )
     project_root = Path(__file__).resolve().parents[1]
     resource_dir = project_root / _RESOURCE_DIR_NAME
     if not resource_dir.exists() or not resource_dir.is_dir():
@@ -903,15 +920,17 @@ def _run_interactive_no_arg_launcher() -> int:
     if selected_mode_index == 4:
         return 0
 
-    resource_pdfs = _discover_resource_pdfs()
-    if not resource_pdfs:
-        _write_stderr_line("No PDF files found in resource/. Add PDFs and re-run.")
+    pdfs = _discover_pdfs_for_interactive()
+    source_type = "current directory" if (Path.cwd() in [p.parent for p in pdfs]) else "resource/"
+    if not pdfs:
+        _write_stderr_line("No PDF files found. Add PDFs to current directory or resource/ and re-run.")
         return 1
 
     file_selection_options = [
-        f"Process all files in resource/ ({len(resource_pdfs)} files)",
-        *[pdf_path.name for pdf_path in resource_pdfs],
+        f"Process all files in {source_type} ({len(pdfs)} files)",
+        *[pdf_path.name for pdf_path in pdfs],
     ]
+
     selected_pdf_index = _prompt_numbered_choice(
         "Select PDF or batch mode",
         file_selection_options,
@@ -920,7 +939,7 @@ def _run_interactive_no_arg_launcher() -> int:
     selected_pdfs: list[Path]
     output_by_pdf: dict[Path, str]
     if selected_pdf_index == 0:
-        selected_pdfs = list(resource_pdfs)
+        selected_pdfs = list(pdfs)
         default_output_root = _resolve_project_root() / _DEFAULT_DOWNLOADS_DIR_NAME
         output_root_raw = _prompt_text(
             f"Output base directory for all files [{default_output_root}]: ",
@@ -932,7 +951,7 @@ def _run_interactive_no_arg_launcher() -> int:
             for pdf_path in selected_pdfs
         }
     else:
-        selected_pdf = resource_pdfs[selected_pdf_index - 1]
+        selected_pdf = pdfs[selected_pdf_index - 1]
         selected_pdfs = [selected_pdf]
         default_output = _resolve_default_output_arg(selected_pdf)
         output_value = _prompt_text(
