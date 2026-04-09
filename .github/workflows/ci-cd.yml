@@ -1,0 +1,66 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - 'v*' # Trigger CD when a tag starting with 'v' is pushed (e.g., v1.0.0)
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # --- CI: Test and Lint ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .[full]
+          python -m pip install pytest
+
+      - name: Run tests
+        run: |
+          pytest tests/
+
+  # --- CD: Build and Release ---
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Build package
+        run: |
+          python -m build cli/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cli/dist/*.whl
+            cli/dist/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

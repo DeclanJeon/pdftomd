@@ -83,7 +83,9 @@ _DEFAULTS: dict[str, object] = {
     "split_every": None,
     "workers": None,
 }
-_ROOT_ALLOWED_KEYS: frozenset[str] = frozenset({"active_profile", "profiles", *_OPTION_KEYS})
+_ROOT_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {"active_profile", "profiles", *_OPTION_KEYS}
+)
 _PROFILE_ALLOWED_KEYS: frozenset[str] = frozenset(_OPTION_KEYS)
 _PROGRESS_LINE_PATTERN = re.compile(
     r"^Progress:\s*(?P<percent>\d+)%\s*(?P<stage>.*)$",
@@ -170,7 +172,9 @@ def _coerce_bool(raw_value: object, context: str) -> bool:
 
 def _coerce_mode(raw_value: object, context: str) -> str:
     if not isinstance(raw_value, str):
-        raise CliRuntimeValidationError(f"Invalid ocr_mode for {context}: {raw_value!r}")
+        raise CliRuntimeValidationError(
+            f"Invalid ocr_mode for {context}: {raw_value!r}"
+        )
     value = raw_value.strip().lower()
     if value in {"off", "strict", "auto"}:
         return value
@@ -179,7 +183,9 @@ def _coerce_mode(raw_value: object, context: str) -> str:
 
 def _coerce_engine(raw_value: object, context: str) -> str:
     if not isinstance(raw_value, str):
-        raise CliRuntimeValidationError(f"Invalid ocr_engine for {context}: {raw_value!r}")
+        raise CliRuntimeValidationError(
+            f"Invalid ocr_engine for {context}: {raw_value!r}"
+        )
     value = raw_value.strip().lower()
     if value in {"rapidocr", "tesseract"}:
         return value
@@ -188,7 +194,9 @@ def _coerce_engine(raw_value: object, context: str) -> str:
 
 def _coerce_layout(raw_value: object, context: str) -> str:
     if not isinstance(raw_value, str):
-        raise CliRuntimeValidationError(f"Invalid ocr_layout for {context}: {raw_value!r}")
+        raise CliRuntimeValidationError(
+            f"Invalid ocr_layout for {context}: {raw_value!r}"
+        )
     value = raw_value.strip().lower()
     if value in {"auto", "vertical", "horizontal"}:
         return value
@@ -197,7 +205,9 @@ def _coerce_layout(raw_value: object, context: str) -> str:
 
 def _coerce_zh_script(raw_value: object, context: str) -> str:
     if not isinstance(raw_value, str):
-        raise CliRuntimeValidationError(f"Invalid zh_script for {context}: {raw_value!r}")
+        raise CliRuntimeValidationError(
+            f"Invalid zh_script for {context}: {raw_value!r}"
+        )
     value = raw_value.strip().lower()
     if value in {"keep", "hant", "hans"}:
         return value
@@ -207,10 +217,14 @@ def _coerce_zh_script(raw_value: object, context: str) -> str:
 def _normalize_option_value(key: str, raw_value: object, context: str) -> object:
     if key in {"output", "output_dir", "profile"}:
         if not isinstance(raw_value, str):
-            raise CliRuntimeValidationError(f"Invalid {key} for {context}: {raw_value!r}")
+            raise CliRuntimeValidationError(
+                f"Invalid {key} for {context}: {raw_value!r}"
+            )
         value = raw_value.strip()
         if not value:
-            raise CliRuntimeValidationError(f"Invalid {key} for {context}: {raw_value!r}")
+            raise CliRuntimeValidationError(
+                f"Invalid {key} for {context}: {raw_value!r}"
+            )
         return value
     if key in {"force", "classical_zh_postprocess", "key_content_fallback"}:
         return _coerce_bool(raw_value, context)
@@ -323,7 +337,9 @@ def _load_config_file(path: Path) -> dict[str, object]:
     try:
         payload = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except json.JSONDecodeError as error:
-        raise CliRuntimeValidationError(f"Invalid config JSON at {path}: {error.msg}") from error
+        raise CliRuntimeValidationError(
+            f"Invalid config JSON at {path}: {error.msg}"
+        ) from error
     if not isinstance(payload, dict):
         raise CliRuntimeValidationError(f"Config root must be an object: {path}")
     return cast(dict[str, object], payload)
@@ -358,13 +374,17 @@ def _validate_config_payload(payload: dict[str, object]) -> None:
                 f"Profile '{profile_name}' must be an object"
             )
         typed_profile_payload = cast(dict[str, object], profile_payload)
-        unknown_profile_keys = sorted(set(typed_profile_payload.keys()) - _PROFILE_ALLOWED_KEYS)
+        unknown_profile_keys = sorted(
+            set(typed_profile_payload.keys()) - _PROFILE_ALLOWED_KEYS
+        )
         if unknown_profile_keys:
             raise CliRuntimeValidationError(
                 f"Unknown profile key(s) in '{profile_name}': {', '.join(unknown_profile_keys)}"
             )
         for option_key, option_value in typed_profile_payload.items():
-            _ = _normalize_option_value(option_key, option_value, f"profile:{profile_name}")
+            _ = _normalize_option_value(
+                option_key, option_value, f"profile:{profile_name}"
+            )
 
 
 def _parse_convert_cli(argv: list[str]) -> tuple[dict[str, object], str, float]:
@@ -396,7 +416,9 @@ def _parse_convert_cli(argv: list[str]) -> tuple[dict[str, object], str, float]:
     if output_value is not None and output_dir_value is not None:
         raise CliRuntimeValidationError("Choose only one: --output or --output-dir.")
     if output_dir_value is not None:
-        cli_values["output_dir"] = _normalize_option_value("output_dir", output_dir_value, "cli")
+        cli_values["output_dir"] = _normalize_option_value(
+            "output_dir", output_dir_value, "cli"
+        )
     if cast(bool, parsed.force):
         cli_values["force"] = True
     if cast(bool, parsed.ocr_fallback):
@@ -404,31 +426,45 @@ def _parse_convert_cli(argv: list[str]) -> tuple[dict[str, object], str, float]:
     else:
         ocr_mode_value = cast(str | None, parsed.ocr)
         if ocr_mode_value is not None:
-            cli_values["ocr_mode"] = _normalize_option_value("ocr_mode", ocr_mode_value, "cli")
+            cli_values["ocr_mode"] = _normalize_option_value(
+                "ocr_mode", ocr_mode_value, "cli"
+            )
     ocr_engine_value = cast(str | None, parsed.ocr_engine)
     if ocr_engine_value is not None:
-        cli_values["ocr_engine"] = _normalize_option_value("ocr_engine", ocr_engine_value, "cli")
+        cli_values["ocr_engine"] = _normalize_option_value(
+            "ocr_engine", ocr_engine_value, "cli"
+        )
     ocr_layout_value = cast(str | None, parsed.ocr_layout)
     if ocr_layout_value is not None:
-        cli_values["ocr_layout"] = _normalize_option_value("ocr_layout", ocr_layout_value, "cli")
+        cli_values["ocr_layout"] = _normalize_option_value(
+            "ocr_layout", ocr_layout_value, "cli"
+        )
     zh_script_value = cast(str | None, parsed.zh_script)
     if zh_script_value is not None:
-        cli_values["zh_script"] = _normalize_option_value("zh_script", zh_script_value, "cli")
+        cli_values["zh_script"] = _normalize_option_value(
+            "zh_script", zh_script_value, "cli"
+        )
     if cast(bool, parsed.ocr_classical_zh_postprocess):
         cli_values["classical_zh_postprocess"] = True
     if cast(bool, parsed.ocr_key_content_fallback):
         cli_values["key_content_fallback"] = True
     split_preset_value = cast(str | None, parsed.split_preset)
     if split_preset_value is not None:
-        cli_values["split_preset"] = _normalize_option_value("split_preset", split_preset_value, "cli")
+        cli_values["split_preset"] = _normalize_option_value(
+            "split_preset", split_preset_value, "cli"
+        )
     split_every_value = cast(str | None, parsed.split_every)
     if split_every_value is not None:
-        cli_values["split_every"] = _normalize_option_value("split_every", split_every_value, "cli")
+        cli_values["split_every"] = _normalize_option_value(
+            "split_every", split_every_value, "cli"
+        )
     workers_value = cast(str | None, parsed.workers)
     if workers_value is not None:
         cli_values["workers"] = _normalize_option_value("workers", workers_value, "cli")
     if "split_preset" in cli_values and "split_every" in cli_values:
-        raise CliRuntimeValidationError("Choose only one split mode: split_preset or split_every.")
+        raise CliRuntimeValidationError(
+            "Choose only one split mode: split_preset or split_every."
+        )
     profile_value = cast(str | None, parsed.profile)
     if profile_value is not None:
         cli_values["profile"] = _normalize_option_value("profile", profile_value, "cli")
@@ -483,11 +519,15 @@ def _parse_env_values() -> dict[str, object]:
     return env_values
 
 
-def _profile_values_from_payload(payload: dict[str, object], profile_name: str | None) -> dict[str, object]:
+def _profile_values_from_payload(
+    payload: dict[str, object], profile_name: str | None
+) -> dict[str, object]:
     values: dict[str, object] = {}
     for option_key in _OPTION_KEYS:
         if option_key in payload:
-            values[option_key] = _normalize_option_value(option_key, payload[option_key], "config")
+            values[option_key] = _normalize_option_value(
+                option_key, payload[option_key], "config"
+            )
 
     selected_profile = profile_name
     if selected_profile is None:
@@ -503,7 +543,9 @@ def _profile_values_from_payload(payload: dict[str, object], profile_name: str |
         raise CliRuntimeValidationError(f"Unknown profile: {selected_profile}")
     profile_payload = profiles[selected_profile]
     if not isinstance(profile_payload, dict):
-        raise CliRuntimeValidationError(f"Profile '{selected_profile}' must be an object")
+        raise CliRuntimeValidationError(
+            f"Profile '{selected_profile}' must be an object"
+        )
     typed_profile_payload = cast(dict[str, object], profile_payload)
     for option_key, option_value in typed_profile_payload.items():
         values[option_key] = _normalize_option_value(
@@ -607,15 +649,13 @@ def _augment_legacy_argv_from_effective(
     if zh_script != "keep":
         final_argv.extend(["--zh-script", zh_script])
 
-    if (
-        "classical_zh_postprocess" not in cli_values
-        and bool(resolved.get("classical_zh_postprocess", False))
+    if "classical_zh_postprocess" not in cli_values and bool(
+        resolved.get("classical_zh_postprocess", False)
     ):
         final_argv.append("--ocr-classical-zh-postprocess")
 
-    if (
-        "key_content_fallback" not in cli_values
-        and bool(resolved.get("key_content_fallback", False))
+    if "key_content_fallback" not in cli_values and bool(
+        resolved.get("key_content_fallback", False)
     ):
         final_argv.append("--ocr-key-content-fallback")
 
@@ -681,7 +721,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "init",
         help="Initialize CLI config/profile scaffold.",
     )
-    _ = init_parser.add_argument("--force", action="store_true", help="Overwrite existing config file.")
+    _ = init_parser.add_argument(
+        "--force", action="store_true", help="Overwrite existing config file."
+    )
     _ = init_parser.add_argument("--path", help="Target config file path.")
 
     config_parser = subparsers.add_parser(
@@ -689,7 +731,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Inspect or validate effective CLI configuration.",
     )
     config_subparsers = config_parser.add_subparsers(dest="config_command")
-    config_show = config_subparsers.add_parser("show", help="Show effective config with source trace.")
+    config_show = config_subparsers.add_parser(
+        "show", help="Show effective config with source trace."
+    )
     _ = config_show.add_argument("--profile")
     _ = config_show.add_argument("-o", "--output")
     _ = config_show.add_argument("--force", action="store_true")
@@ -713,7 +757,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "profile",
         help="Manage named CLI profiles.",
     )
-    profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
+    profile_subparsers = profile_parser.add_subparsers(
+        dest="profile_command", required=True
+    )
     _ = profile_subparsers.add_parser("list", help="List available profiles.")
 
     profile_show = profile_subparsers.add_parser("show", help="Show a profile.")
@@ -781,19 +827,27 @@ def _prompt_numbered_choice(
 def _discover_pdfs_for_interactive() -> list[Path]:
     # 1. First, search in current working directory (CWD)
     cwd_pdfs = sorted(
-        [path for path in Path.cwd().iterdir() if path.is_file() and path.suffix.lower() == ".pdf"],
+        [
+            path
+            for path in Path.cwd().iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
+        ],
         key=lambda path: path.name.lower(),
     )
     if cwd_pdfs:
         return cwd_pdfs
-    
+
     # 2. Fallback to resource folder (for development/testing)
     project_root = Path(__file__).resolve().parents[1]
     resource_dir = project_root / _RESOURCE_DIR_NAME
     if not resource_dir.exists() or not resource_dir.is_dir():
         return []
     return sorted(
-        [path for path in resource_dir.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"],
+        [
+            path
+            for path in resource_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
+        ],
         key=lambda path: path.name.lower(),
     )
     project_root = Path(__file__).resolve().parents[1]
@@ -801,7 +855,11 @@ def _discover_pdfs_for_interactive() -> list[Path]:
     if not resource_dir.exists() or not resource_dir.is_dir():
         return []
     return sorted(
-        [path for path in resource_dir.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"],
+        [
+            path
+            for path in resource_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
+        ],
         key=lambda path: path.name.lower(),
     )
 
@@ -864,7 +922,9 @@ def _resolve_missing_ocr_runtime_requirements(engine: str) -> list[str]:
     return missing
 
 
-def _sample_pdf_has_extractable_text(input_pdf: Path, *, sample_pages: int) -> tuple[bool, int]:
+def _sample_pdf_has_extractable_text(
+    input_pdf: Path, *, sample_pages: int
+) -> tuple[bool, int]:
     pypdf = importlib.import_module("pypdf")
     pdf_reader_cls = cast(object, getattr(pypdf, "PdfReader"))
     pdf_reader = cast(object, pdf_reader_cls(str(input_pdf)))
@@ -895,7 +955,9 @@ def _recommend_auto_ocr_defaults(
     dependency_missing = _resolve_missing_ocr_runtime_requirements(recommended_engine)
     if dependency_missing:
         recommended_engine = resolved_ocr_engine
-        dependency_missing = _resolve_missing_ocr_runtime_requirements(recommended_engine)
+        dependency_missing = _resolve_missing_ocr_runtime_requirements(
+            recommended_engine
+        )
     has_extractable_text, sample_pages_checked = _sample_pdf_has_extractable_text(
         input_pdf,
         sample_pages=sample_pages,
@@ -948,7 +1010,9 @@ def _resolve_interactive_ocr_mode_after_dependency_check(
     ][selected_action_index]
 
     if selected_action == _OCR_DEPENDENCY_ACTION_ABORT:
-        raise CliRuntimeValidationError("Aborted interactive run due to missing OCR dependencies")
+        raise CliRuntimeValidationError(
+            "Aborted interactive run due to missing OCR dependencies"
+        )
     if selected_action == _OCR_DEPENDENCY_ACTION_OFF:
         return "off"
     _write_stderr_line(
@@ -967,7 +1031,9 @@ def _resolve_generated_chunk_paths(*, output_arg: str, input_pdf: Path) -> list[
 
 def _resolve_chunk_versions(*, output_arg: str, input_pdf: Path) -> dict[Path, int]:
     versions: dict[Path, int] = {}
-    for chunk_path in _resolve_generated_chunk_paths(output_arg=output_arg, input_pdf=input_pdf):
+    for chunk_path in _resolve_generated_chunk_paths(
+        output_arg=output_arg, input_pdf=input_pdf
+    ):
         try:
             versions[chunk_path] = chunk_path.stat().st_mtime_ns
         except FileNotFoundError:
@@ -983,7 +1049,9 @@ def _collect_new_chunk_paths(
     seen_chunks: set[Path],
 ) -> list[Path]:
     new_chunks: list[Path] = []
-    current_versions = _resolve_chunk_versions(output_arg=output_arg, input_pdf=input_pdf)
+    current_versions = _resolve_chunk_versions(
+        output_arg=output_arg, input_pdf=input_pdf
+    )
     for chunk_path in sorted(current_versions):
         if chunk_path in seen_chunks:
             continue
@@ -996,7 +1064,9 @@ def _collect_new_chunk_paths(
     return new_chunks
 
 
-def _write_chunk_bundle(*, output_arg: str, input_pdf: Path, chunk_paths: list[Path]) -> Path:
+def _write_chunk_bundle(
+    *, output_arg: str, input_pdf: Path, chunk_paths: list[Path]
+) -> Path:
     if not chunk_paths:
         raise CliRuntimeValidationError("No chunk files found to bundle")
 
@@ -1004,7 +1074,9 @@ def _write_chunk_bundle(*, output_arg: str, input_pdf: Path, chunk_paths: list[P
     base_path = _resolve_chunk_output_base(output_path, input_pdf)
     bundle_path = base_path.with_name(f"{base_path.name}_bundle.zip")
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(bundle_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(
+        bundle_path, mode="w", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
         for chunk_path in chunk_paths:
             archive.write(chunk_path, arcname=chunk_path.name)
     return bundle_path
@@ -1032,16 +1104,22 @@ def _run_interactive_no_arg_launcher() -> int:
     if selected_mode_index == 1:
         return _handle_init_command(argparse.Namespace(force=False, path=None))
     if selected_mode_index == 2:
-        return _handle_config_command(argparse.Namespace(config_command="show", path=None))
+        return _handle_config_command(
+            argparse.Namespace(config_command="show", path=None)
+        )
     if selected_mode_index == 3:
         return _handle_profile_command(argparse.Namespace(profile_command="list"))
     if selected_mode_index == 4:
         return 0
 
     pdfs = _discover_pdfs_for_interactive()
-    source_type = "current directory" if (Path.cwd() in [p.parent for p in pdfs]) else "resource/"
+    source_type = (
+        "current directory" if (Path.cwd() in [p.parent for p in pdfs]) else "resource/"
+    )
     if not pdfs:
-        _write_stderr_line("No PDF files found. Add PDFs to current directory or resource/ and re-run.")
+        _write_stderr_line(
+            "No PDF files found. Add PDFs to current directory or resource/ and re-run."
+        )
         return 1
 
     file_selection_options = [
@@ -1125,12 +1203,17 @@ def _run_interactive_no_arg_launcher() -> int:
             [str(value) for value in pdf_to_md.SPLIT_PRESET_CHOICES],
             default_index=1,
         )
-        split_args = ["--split-preset", str(pdf_to_md.SPLIT_PRESET_CHOICES[preset_choice_index])]
+        split_args = [
+            "--split-preset",
+            str(pdf_to_md.SPLIT_PRESET_CHOICES[preset_choice_index]),
+        ]
         split_selected = True
     elif split_mode_index == 2:
         split_every_raw = _prompt_text("Split every N pages [default: 10]: ", "10")
         if not split_every_raw.isdigit() or int(split_every_raw) <= 0:
-            raise CliRuntimeValidationError(f"Invalid split_every in interactive mode: {split_every_raw!r}")
+            raise CliRuntimeValidationError(
+                f"Invalid split_every in interactive mode: {split_every_raw!r}"
+            )
         split_args = ["--split-every", split_every_raw]
         split_selected = True
 
@@ -1165,7 +1248,9 @@ def _run_interactive_no_arg_launcher() -> int:
         elif ocr_mode == "auto":
             convert_argv.extend(["--ocr", "auto"])
         if ocr_mode in {"strict", "auto"}:
-            convert_argv.extend(["--ocr-engine", ocr_engine, "--ocr-layout", ocr_layout])
+            convert_argv.extend(
+                ["--ocr-engine", ocr_engine, "--ocr-layout", ocr_layout]
+            )
         if classical_postprocess:
             convert_argv.append("--ocr-classical-zh-postprocess")
         if key_content_fallback:
@@ -1233,7 +1318,9 @@ def _parse_int_token(value: str) -> int | None:
     normalized = value.strip().rstrip(",;").rstrip("%")
     if not normalized:
         return None
-    if normalized.isdigit() or (normalized.startswith("-") and normalized[1:].isdigit()):
+    if normalized.isdigit() or (
+        normalized.startswith("-") and normalized[1:].isdigit()
+    ):
         return int(normalized)
     return None
 
@@ -1298,7 +1385,9 @@ def _split_stage_tokens(stage_text: str) -> tuple[str, dict[str, str]]:
         normalized_value = value.strip().rstrip(",;")
         if normalized_key:
             token_values[normalized_key] = normalized_value
-    stage_label = " ".join(stage_label_parts).strip() if stage_label_parts else stage_text.strip()
+    stage_label = (
+        " ".join(stage_label_parts).strip() if stage_label_parts else stage_text.strip()
+    )
     return stage_label, token_values
 
 
@@ -1480,7 +1569,9 @@ def _emit_live_status_line(
     )
 
 
-def _invoke_legacy_main_with_live_monitor(argv: list[str], context: _LiveMonitorContext) -> int:
+def _invoke_legacy_main_with_live_monitor(
+    argv: list[str], context: _LiveMonitorContext
+) -> int:
     command = [sys.executable, str(_resolve_converter_script_path()), *argv]
     cpu_cores = os.cpu_count() or 1
     _write_stderr_line(
@@ -1508,7 +1599,9 @@ def _invoke_legacy_main_with_live_monitor(argv: list[str], context: _LiveMonitor
             return
         except subprocess.TimeoutExpired:
             pass
-        _write_stderr_line("Live monitor: child did not terminate in grace period; killing")
+        _write_stderr_line(
+            "Live monitor: child did not terminate in grace period; killing"
+        )
         process.kill()
         _ = process.wait()
 
@@ -1554,7 +1647,9 @@ def _invoke_legacy_main_with_live_monitor(argv: list[str], context: _LiveMonitor
                     counter_value: int | None = None
                     counter_kind_now: str | None = None
                     page_counter = _parse_int_token(token_values.get("current", ""))
-                    chunk_counter = _parse_int_token(token_values.get("chunk_index", ""))
+                    chunk_counter = _parse_int_token(
+                        token_values.get("chunk_index", "")
+                    )
                     if page_counter is not None:
                         counter_value = page_counter
                         counter_kind_now = "page"
@@ -1594,7 +1689,10 @@ def _invoke_legacy_main_with_live_monitor(argv: list[str], context: _LiveMonitor
                     should_emit = (
                         bounded_percent >= 100
                         or (last_live_emit_time <= 0.0)
-                        or (now - last_live_emit_time >= context.progress_interval_seconds)
+                        or (
+                            now - last_live_emit_time
+                            >= context.progress_interval_seconds
+                        )
                     )
                     if should_emit:
                         speed_override = None
@@ -1610,7 +1708,10 @@ def _invoke_legacy_main_with_live_monitor(argv: list[str], context: _LiveMonitor
                         )
                         last_live_emit_time = now
 
-                if context.split_selected and context.delivery_mode == _DELIVERY_IMMEDIATE:
+                if (
+                    context.split_selected
+                    and context.delivery_mode == _DELIVERY_IMMEDIATE
+                ):
                     new_chunk_paths = _collect_new_chunk_paths(
                         output_arg=context.output_arg,
                         input_pdf=context.input_pdf,
@@ -1677,7 +1778,9 @@ def _invoke_legacy_main(argv: list[str]) -> int:
 
 def _write_config_file(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    _ = path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _ = path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _ns_str(args: argparse.Namespace, key: str) -> str | None:
@@ -1698,7 +1801,9 @@ def _ns_bool(args: argparse.Namespace, key: str) -> bool:
 
 def _handle_init_command(args: argparse.Namespace) -> int:
     path_value = _ns_str(args, "path")
-    target_path = Path(path_value).expanduser() if path_value else _resolve_config_path()
+    target_path = (
+        Path(path_value).expanduser() if path_value else _resolve_config_path()
+    )
     if target_path.exists() and not _ns_bool(args, "force"):
         _write_stderr_line(
             f"Config file already exists: {target_path} (use --force to overwrite)"
@@ -1720,31 +1825,45 @@ def _config_show_cli_values(args: argparse.Namespace) -> dict[str, object]:
     else:
         ocr_mode_value = _ns_str(args, "ocr")
         if ocr_mode_value is not None:
-            cli_values["ocr_mode"] = _normalize_option_value("ocr_mode", ocr_mode_value, "cli")
+            cli_values["ocr_mode"] = _normalize_option_value(
+                "ocr_mode", ocr_mode_value, "cli"
+            )
     ocr_engine_value = _ns_str(args, "ocr_engine")
     if ocr_engine_value is not None:
-        cli_values["ocr_engine"] = _normalize_option_value("ocr_engine", ocr_engine_value, "cli")
+        cli_values["ocr_engine"] = _normalize_option_value(
+            "ocr_engine", ocr_engine_value, "cli"
+        )
     ocr_layout_value = _ns_str(args, "ocr_layout")
     if ocr_layout_value is not None:
-        cli_values["ocr_layout"] = _normalize_option_value("ocr_layout", ocr_layout_value, "cli")
+        cli_values["ocr_layout"] = _normalize_option_value(
+            "ocr_layout", ocr_layout_value, "cli"
+        )
     zh_script_value = _ns_str(args, "zh_script")
     if zh_script_value is not None:
-        cli_values["zh_script"] = _normalize_option_value("zh_script", zh_script_value, "cli")
+        cli_values["zh_script"] = _normalize_option_value(
+            "zh_script", zh_script_value, "cli"
+        )
     if _ns_bool(args, "ocr_classical_zh_postprocess"):
         cli_values["classical_zh_postprocess"] = True
     if _ns_bool(args, "ocr_key_content_fallback"):
         cli_values["key_content_fallback"] = True
     split_preset_value = _ns_str(args, "split_preset")
     if split_preset_value is not None:
-        cli_values["split_preset"] = _normalize_option_value("split_preset", split_preset_value, "cli")
+        cli_values["split_preset"] = _normalize_option_value(
+            "split_preset", split_preset_value, "cli"
+        )
     split_every_value = _ns_str(args, "split_every")
     if split_every_value is not None:
-        cli_values["split_every"] = _normalize_option_value("split_every", split_every_value, "cli")
+        cli_values["split_every"] = _normalize_option_value(
+            "split_every", split_every_value, "cli"
+        )
     workers_value = _ns_str(args, "workers")
     if workers_value is not None:
         cli_values["workers"] = _normalize_option_value("workers", workers_value, "cli")
     if "split_preset" in cli_values and "split_every" in cli_values:
-        raise CliRuntimeValidationError("Choose only one split mode: split_preset or split_every.")
+        raise CliRuntimeValidationError(
+            "Choose only one split mode: split_preset or split_every."
+        )
     profile_value = _ns_str(args, "profile")
     if profile_value is not None:
         cli_values["profile"] = _normalize_option_value("profile", profile_value, "cli")
@@ -1827,7 +1946,9 @@ def _handle_profile_command(args: argparse.Namespace) -> int:
             raise CliRuntimeValidationError(f"Unknown profile: {requested_name}")
         profile_payload = profiles[requested_name]
         if not isinstance(profile_payload, dict):
-            raise CliRuntimeValidationError(f"Profile '{requested_name}' must be an object")
+            raise CliRuntimeValidationError(
+                f"Profile '{requested_name}' must be an object"
+            )
         printable: dict[str, object] = {
             "profile": requested_name,
             "values": cast(dict[str, object], profile_payload),
@@ -1860,7 +1981,9 @@ def _handle_profile_command(args: argparse.Namespace) -> int:
             profile_payload = {}
             profiles[profile_name] = profile_payload
         if not isinstance(profile_payload, dict):
-            raise CliRuntimeValidationError(f"Profile '{profile_name}' must be an object")
+            raise CliRuntimeValidationError(
+                f"Profile '{profile_name}' must be an object"
+            )
         profile_payload[key] = normalized_value
         _write_config_file(config_path, payload)
         return 0
@@ -1891,7 +2014,9 @@ def main(argv: list[str] | None = None) -> int:
     command = cast(str, args.command)
     try:
         if command == "convert":
-            cli_values, progress_detail, progress_interval_seconds = _parse_convert_cli(remainder)
+            cli_values, progress_detail, progress_interval_seconds = _parse_convert_cli(
+                remainder
+            )
             _, resolved, source, selected_profile = _build_effective_state(
                 cli_values=cli_values,
                 selected_profile=cast(str | None, cli_values.get("profile")),
@@ -1982,6 +2107,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run() -> None:
+    pdf_to_md.ensure_essential_directories()
     raise SystemExit(main())
 
 

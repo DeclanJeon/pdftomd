@@ -1540,6 +1540,29 @@ def get_optional_backend_missing_dependency_message(backend: str) -> str:
 def _write_stderr_line(message: str) -> None:
     _ = sys.stderr.write(f"{message}\n")
 
+def ensure_essential_directories() -> None:
+    root = _resolve_project_root()
+    essentials = ["downloads", "report", "output"]
+    
+    _write_stderr_line("🔍 시스템 환경 체크 중...")
+    
+    created_any = False
+    for dir_name in essentials:
+        target = root / dir_name
+        if not target.exists():
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                _write_stderr_line(f"📂 필수 디렉토리가 없어 생성했습니다: {target.name}/")
+                created_any = True
+            except Exception as e:
+                _write_stderr_line(f"⚠️ 디렉토리 생성 실패 ({dir_name}): {e}")
+    
+    if created_any:
+        _write_stderr_line("✅ 환경 설정이 완료되었습니다. 작업 파일을 준비해 주세요.")
+    else:
+        _write_stderr_line("✅ 모든 시스템 환경이 준비되었습니다.")
+    _write_stderr_line("")
+
 
 def _build_progress_event(percent: int, stage: str) -> _ProgressEvent:
     bounded_percent = max(0, min(100, percent))
