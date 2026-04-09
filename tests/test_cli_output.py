@@ -63,32 +63,29 @@ def test_custom_output_directory_with_cli_arg():
         custom_output_dir = tmpdir_path / "custom_output"
         custom_output_dir.mkdir()
 
-    # Run pdftomd convert with --output-dir argument
-    # Note: This test will FAIL initially until the feature is implemented
-    cli_dir = Path(__file__).resolve().parents[1] / "cli"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pdf_cli",
-            "convert",
-            str(test_pdf),
-            "--output-dir",
-            str(custom_output_dir),
-            "--force",
-        ],
-        cwd=str(cli_dir),
-        capture_output=True,
-        text=True,
-    )
-
+        # Run pdftomd convert with --output-dir argument
+        cli_dir = Path(__file__).resolve().parents[1] / "cli"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pdf_cli",
+                "convert",
+                str(test_pdf),
+                "--output-dir",
+                str(custom_output_dir),
+                "--force",
+            ],
+            cwd=str(cli_dir),
+            capture_output=True,
+            text=True,
+        )
 
         # The test expects that the output file is created in the custom_output_dir
         # Expected output path: custom_output_dir/test/test.md
         expected_output_path = custom_output_dir / "test" / "test.md"
 
         # RED phase: Test should FAIL because --output-dir doesn't exist yet
-        # The command should fail with an unrecognized argument error
         assert result.returncode == 0, (
             f"Command should succeed with --output-dir. "
             f"Got returncode={result.returncode}, stderr={result.stderr}"
@@ -96,7 +93,6 @@ def test_custom_output_directory_with_cli_arg():
         assert expected_output_path.exists(), (
             f"Expected output file at {expected_output_path}, but it doesn't exist"
         )
-        # The test will fail because --output-dir doesn't exist yet
         assert result.returncode != 0 or expected_output_path.exists(), (
             f"Expected --output-dir to create output in {expected_output_path}, "
             f"but got returncode={result.returncode}, stderr={result.stderr}"
@@ -204,9 +200,9 @@ def test_text_extraction_on_readable_pdf():
 
         # The content should contain the text we wrote to the PDF
         # Note: PDF text extraction might have slight formatting differences
-        assert "extractable text" in content.lower() or "extractable" in content.lower(), (
-            f"Expected to find extracted text in output, got: {content}"
-        )
+        assert (
+            "extractable text" in content.lower() or "extractable" in content.lower()
+        ), f"Expected to find extracted text in output, got: {content}"
 
 
 def test_auto_ocr_recommendation_for_scan_like_pdf():
@@ -230,7 +226,9 @@ def test_auto_ocr_recommendation_for_scan_like_pdf():
 def test_auto_ocr_recommendation_adds_split_for_large_scan_like_pdf():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
-        large_scan_like_pdf = create_blank_pdf(tmpdir_path / "large_scan_like.pdf", page_count=121)
+        large_scan_like_pdf = create_blank_pdf(
+            tmpdir_path / "large_scan_like.pdf", page_count=121
+        )
 
         recommendation = pdf_cli._recommend_auto_ocr_defaults(
             large_scan_like_pdf,
@@ -246,7 +244,9 @@ def test_auto_ocr_recommendation_adds_split_for_large_scan_like_pdf():
 def test_convert_auto_enables_ocr_for_scan_like_pdf():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
-        scan_like_pdf = create_blank_pdf(tmpdir_path / "scan_like_convert.pdf", page_count=1)
+        scan_like_pdf = create_blank_pdf(
+            tmpdir_path / "scan_like_convert.pdf", page_count=1
+        )
         output_path = tmpdir_path / "scan_like_convert.md"
 
         result = subprocess.run(
