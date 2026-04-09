@@ -13,6 +13,7 @@ import io
 from collections.abc import Iterable, Iterator
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -102,18 +103,17 @@ _active_progress_format = PROGRESS_FORMAT_TEXT
 
 
 OPTIONAL_BACKENDS: tuple[str, ...] = ()
-WIZARD_IMPLEMENTED_OCR_ENGINES: tuple[str, ...] = ("rapidocr",)
+WIZARD_IMPLEMENTED_OCR_ENGINES: tuple[str, ...] = ("rapidocr", "tesseract")
 
 PDFPLUMBER_TRIGGER_MIN_CHAR_COUNT = 20
 PDFPLUMBER_TRIGGER_MIN_PRINTABLE_RATIO = 0.85
 PDFPLUMBER_MAX_PAGES_PER_DOCUMENT = 8  # DEPRECATED: pdfplumber now primary extractor
 
 
-
-OCR_DEFAULT_ENGINE = "rapidocr"
+OCR_DEFAULT_ENGINE = "tesseract"
 OCR_PAGE_WINDOW_SIZE = 2
-OCR_MAX_DPI = 200
-OCR_MAX_IMAGE_SIZE = (1800, 1800)
+OCR_MAX_DPI = 220
+OCR_MAX_IMAGE_SIZE = (2400, 2400)
 OCR_MIN_CONFIDENCE = 0.45
 OCR_HIGH_CONF_MIN_RATIO = 0.60
 OCR_PAGE_SCORE_CONFIDENCE_VISIBLE_TARGET = 40
@@ -129,7 +129,7 @@ OCR_KEY_CONTENT_MAX_LINES = 5
 OCR_KEY_CONTENT_MIN_PAGE_SCORE = 0.25
 OCR_TESSERACT_MIN_WORD_CONFIDENCE = 40.0
 OCR_TESSERACT_MIN_LINE_CONFIDENCE = 48.0
-OCR_WEAK_PAGE_PRESET_DPIS: tuple[int, ...] = (OCR_MAX_DPI, 240)
+OCR_WEAK_PAGE_PRESET_DPIS: tuple[int, ...] = (OCR_MAX_DPI, 300)
 OCR_SHORT_CJK_FRAGMENT_WHITELIST: frozenset[str] = frozenset(
     {
         "之",
@@ -158,6 +158,9 @@ OCR_PDF2IMAGE_USE_PDFTOCAIRO = True
 OCR_SIMILARITY_MAX_BUCKET_CANDIDATES = 24
 OCR_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
 OCR_TRANSIENT_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (0.2, 0.5)
+OCR_BINARIZATION_THRESHOLDS: tuple[int, ...] = (150, 175)
+OCR_TESSERACT_EARLY_ACCEPT_SCORE = 0.30
+OCR_SCAN_ONLY_SAMPLE_PAGES = 3
 ZH_SCRIPT_KEEP = "keep"
 ZH_SCRIPT_HANT = "hant"
 ZH_SCRIPT_HANS = "hans"
@@ -230,7 +233,10 @@ CLASSICAL_ZH_PHRASE_CORRECTIONS: tuple[tuple[str, str], ...] = (
     ("日藍夢", "曰噩夢"),
     ("日思夢", "曰思夢"),
     ("日夢日喜", "曰寤夢曰喜"),
-    ("木能傳兹者何問卿先生曲家藏晋葛秘本最加泰", "本能傳兹者何問卿先生山家藏晉仙翁秘本加泰"),
+    (
+        "木能傳兹者何問卿先生曲家藏晋葛秘本最加泰",
+        "本能傳兹者何問卿先生山家藏晉仙翁秘本加泰",
+    ),
     ("占一书圆經既于泰炬业復千欢罕嘴类", "夢占一書圓經既於秦漢術業復於漠儒致真罕覯類"),
     ("茂金害仰览者有一旁总有一古在一", "成全書仰覽者有一夢必有一占有一占必有一驗"),
     ("一鑫诚", "一驗誠"),
@@ -261,6 +267,7 @@ _OPTIONAL_BACKEND_GUIDANCE: dict[str, str] = {}
 
 _DEPENDENCY_INSTALL_HINT_BY_ENGINE: dict[str, str] = {
     "rapidocr": "`pdf2image`, `rapidocr_onnxruntime`, and Poppler tools",
+    "tesseract": "`tesseract-ocr` with `kor` language data",
 }
 
 
@@ -282,9 +289,9 @@ class OcrFallbackPipelineResult:
 
 
 WIZARD_PRESET_PROFILES: dict[str, WizardPreset] = {
-    "fast": WizardPreset(ocr_fallback=False, ocr_engine="rapidocr"),
-    "balanced": WizardPreset(ocr_fallback=True, ocr_engine="rapidocr"),
-    "accurate": WizardPreset(ocr_fallback=True, ocr_engine="rapidocr"),
+    "fast": WizardPreset(ocr_fallback=False, ocr_engine=OCR_DEFAULT_ENGINE),
+    "balanced": WizardPreset(ocr_fallback=True, ocr_engine=OCR_DEFAULT_ENGINE),
+    "accurate": WizardPreset(ocr_fallback=True, ocr_engine=OCR_DEFAULT_ENGINE),
 }
 
 
@@ -294,8 +301,16 @@ def _normalize_page_text(text: str) -> str:
     return normalized
 
 
+def _is_hangul_char(character: str) -> bool:
+    return ("\uac00" <= character <= "\ud7a3") or ("\u1100" <= character <= "\u11ff")
+
+
+def _is_cjk_or_hangul_char(character: str) -> bool:
+    return ("\u4e00" <= character <= "\u9fff") or _is_hangul_char(character)
+
+
 def _text_quality_score(text: str) -> tuple[int, int]:
-    cjk_count = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    cjk_count = sum(1 for char in text if _is_cjk_or_hangul_char(char))
     visible_count = sum(1 for char in text if not char.isspace())
     return cjk_count, visible_count
 
@@ -304,7 +319,7 @@ def _line_similarity_key(text: str) -> str:
     return "".join(
         character
         for character in text
-        if ("\u4e00" <= character <= "\u9fff") or character.isalnum()
+        if _is_cjk_or_hangul_char(character) or character.isalnum()
     )
 
 
@@ -350,7 +365,10 @@ def _is_noise_line(text: str) -> bool:
         return normalized in OCR_SHORT_CJK_FRAGMENT_WHITELIST
 
     cjk_count, visible_count = _text_quality_score(stripped_text)
-    latin_count = sum(1 for character in stripped_text if "a" <= character.lower() <= "z")
+    hangul_count = sum(1 for character in stripped_text if _is_hangul_char(character))
+    latin_count = sum(
+        1 for character in stripped_text if "a" <= character.lower() <= "z"
+    )
     digit_count = sum(1 for character in stripped_text if character.isdigit())
     symbol_count = sum(
         1
@@ -359,6 +377,8 @@ def _is_noise_line(text: str) -> bool:
     )
 
     if cjk_count > 0:
+        if hangul_count > 0 and visible_count <= 2:
+            return True
         if visible_count == 1 and not _is_whitelisted_short_cjk_fragment(stripped_text):
             return True
         if symbol_count >= max(1, visible_count // 2) and cjk_count < visible_count:
@@ -449,7 +469,9 @@ def _is_same_line_region(a: _OcrLineMetadata, b: _OcrLineMetadata) -> bool:
     return abs(ax - bx) <= x_tolerance and abs(ay - by) <= y_tolerance
 
 
-def _prefer_ocr_line_metadata(a: _OcrLineMetadata, b: _OcrLineMetadata) -> _OcrLineMetadata:
+def _prefer_ocr_line_metadata(
+    a: _OcrLineMetadata, b: _OcrLineMetadata
+) -> _OcrLineMetadata:
     if a["conf"] != b["conf"]:
         return a if a["conf"] > b["conf"] else b
 
@@ -474,8 +496,12 @@ def _cluster_ocr_line_metadata(lines: list[_OcrLineMetadata]) -> list[_OcrLineMe
         for cluster_index, existing in enumerate(stage1_clusters):
             if not _is_same_line_region(line, existing):
                 continue
-            if line["text"] == existing["text"] or _is_subsumed_line(line["text"], existing["text"]):
-                stage1_clusters[cluster_index] = _prefer_ocr_line_metadata(existing, line)
+            if line["text"] == existing["text"] or _is_subsumed_line(
+                line["text"], existing["text"]
+            ):
+                stage1_clusters[cluster_index] = _prefer_ocr_line_metadata(
+                    existing, line
+                )
                 merged = True
                 break
         if not merged:
@@ -488,7 +514,9 @@ def _cluster_ocr_line_metadata(lines: list[_OcrLineMetadata]) -> list[_OcrLineMe
             if not _is_same_line_region(line, existing):
                 continue
             if _is_similar_line(line["text"], existing["text"]):
-                stage2_clusters[cluster_index] = _prefer_ocr_line_metadata(existing, line)
+                stage2_clusters[cluster_index] = _prefer_ocr_line_metadata(
+                    existing, line
+                )
                 merged = True
                 break
         if not merged:
@@ -509,7 +537,9 @@ def _compute_page_quality_score_cached(normalized_text: str) -> float:
     cleaned_lines = _clean_ocr_lines(page_lines)
     cleaned_text = "\n".join(cleaned_lines)
     cjk_count, visible_count = _text_quality_score(cleaned_text)
-    latin_count = sum(1 for character in cleaned_text if "a" <= character.lower() <= "z")
+    latin_count = sum(
+        1 for character in cleaned_text if "a" <= character.lower() <= "z"
+    )
 
     line_count = len(page_lines)
     noise_count = sum(1 for line in page_lines if _is_noise_line(line))
@@ -546,9 +576,9 @@ def _compute_page_quality_score_cached(normalized_text: str) -> float:
         ]
         normalized_tokens = [token for token in tokens if token]
         if normalized_tokens:
-            short_token_ratio = sum(1 for token in normalized_tokens if len(token) <= 2) / len(
-                normalized_tokens
-            )
+            short_token_ratio = sum(
+                1 for token in normalized_tokens if len(token) <= 2
+            ) / len(normalized_tokens)
             lexical_noise_penalty = short_token_ratio * 0.35
     elif visible_count > 0 and latin_count > cjk_count:
         latin_ratio = latin_count / visible_count
@@ -566,7 +596,9 @@ def _compute_page_quality_score_cached(normalized_text: str) -> float:
 
     noise_threshold = thresholds["noise_threshold"]
     if noise_penalty > noise_threshold:
-        quality_score -= (noise_penalty - noise_threshold) * OCR_PAGE_SCORE_NOISE_PENALTY_WEIGHT
+        quality_score -= (
+            noise_penalty - noise_threshold
+        ) * OCR_PAGE_SCORE_NOISE_PENALTY_WEIGHT
 
     return round(quality_score, 6)
 
@@ -611,7 +643,9 @@ def _resolve_ocr_quality_thresholds(
         if key not in resolved:
             raise ValueError(f"Unsupported OCR quality threshold key: {key}")
         if not isinstance(value, (int, float)):
-            raise ValueError(f"Invalid OCR quality threshold `{key}`: non-numeric value")
+            raise ValueError(
+                f"Invalid OCR quality threshold `{key}`: non-numeric value"
+            )
         float_value = float(value)
         if float_value < 0.0 or float_value > 1.0:
             raise ValueError(
@@ -692,7 +726,9 @@ def _apply_phrase_corrections(
                 else ""
             )
             left_ok = left_boundary_index < 0 or _is_boundary_character(left_character)
-            right_ok = right_boundary_index >= len(source_text) or _is_boundary_character(right_character)
+            right_ok = right_boundary_index >= len(
+                source_text
+            ) or _is_boundary_character(right_character)
 
             chunks.append(source_text[cursor:hit_index])
             if left_ok and right_ok:
@@ -715,7 +751,9 @@ def _apply_phrase_corrections(
             else:
                 updated_text = corrected
         else:
-            updated_text, occurrence_count = _replace_with_boundary_guard(corrected, source, target)
+            updated_text, occurrence_count = _replace_with_boundary_guard(
+                corrected, source, target
+            )
         if occurrence_count <= 0:
             continue
         corrected = updated_text
@@ -731,7 +769,10 @@ def _is_low_confidence_page_text(text: str) -> bool:
         return True
     if _is_weak_page_text(normalized_text):
         return True
-    return _compute_page_quality_score(normalized_text) < OCR_CLASSICAL_ZH_AGGRESSIVE_SCORE_THRESHOLD
+    return (
+        _compute_page_quality_score(normalized_text)
+        < OCR_CLASSICAL_ZH_AGGRESSIVE_SCORE_THRESHOLD
+    )
 
 
 def _apply_classical_zh_postprocess(page_texts: list[str]) -> tuple[list[str], str]:
@@ -752,15 +793,19 @@ def _apply_classical_zh_postprocess(page_texts: list[str]) -> tuple[list[str], s
             safe_examples.append(f"p{page_number}:{safe_page_examples[0]}")
 
         if _is_low_confidence_page_text(corrected):
-            corrected, aggressive_count, aggressive_page_examples = _apply_phrase_corrections(
-                corrected,
-                CLASSICAL_ZH_AGGRESSIVE_CORRECTIONS,
+            corrected, aggressive_count, aggressive_page_examples = (
+                _apply_phrase_corrections(
+                    corrected,
+                    CLASSICAL_ZH_AGGRESSIVE_CORRECTIONS,
+                )
             )
             if aggressive_count > 0:
                 aggressive_pages += 1
                 aggressive_replacements += aggressive_count
                 if aggressive_page_examples and len(aggressive_examples) < 3:
-                    aggressive_examples.append(f"p{page_number}:{aggressive_page_examples[0]}")
+                    aggressive_examples.append(
+                        f"p{page_number}:{aggressive_page_examples[0]}"
+                    )
 
         corrected_pages.append(_normalize_page_text(corrected))
 
@@ -775,7 +820,9 @@ def _apply_classical_zh_postprocess(page_texts: list[str]) -> tuple[list[str], s
     return corrected_pages, diagnostics
 
 
-def _build_key_content_lines(text: str, *, max_lines: int = OCR_KEY_CONTENT_MAX_LINES) -> list[str]:
+def _build_key_content_lines(
+    text: str, *, max_lines: int = OCR_KEY_CONTENT_MAX_LINES
+) -> list[str]:
     normalized_text = _normalize_page_text(text)
     if not normalized_text:
         return []
@@ -801,9 +848,7 @@ def _render_key_content_fallback_page(*, page_number: int, source_text: str) -> 
     key_lines = _build_key_content_lines(source_text)
     if not key_lines:
         return ""
-    return "\n".join(
-        [f"[KEY-CONTENT FALLBACK page={page_number}]", *key_lines]
-    )
+    return "\n".join([f"[KEY-CONTENT FALLBACK page={page_number}]", *key_lines])
 
 
 def _extract_page_raw_texts(
@@ -813,15 +858,17 @@ def _extract_page_raw_texts(
     max_pages: int | None = None,
     progress_callback: _PageProgressCallback | None = None,
 ) -> list[str]:
-    resolved_page_count = page_count if page_count and page_count > 0 else _extract_page_count(input_pdf)
+    resolved_page_count = (
+        page_count if page_count and page_count > 0 else _extract_page_count(input_pdf)
+    )
     if max_pages is not None:
         resolved_page_count = min(resolved_page_count, max(1, max_pages))
-    
+
     # Try pdfplumber first (primary)
     try:
         pdfplumber = importlib.import_module("pdfplumber")
         pdfplumber_open = cast(_PdfPlumberOpen, getattr(pdfplumber, "open"))
-        
+
         page_texts: list[str] = []
         with pdfplumber_open(str(input_pdf)) as pdf_document:
             for page_number in range(min(resolved_page_count, len(pdf_document.pages))):
@@ -830,20 +877,22 @@ def _extract_page_raw_texts(
                 page_texts.append(extracted_text or "")
                 if progress_callback is not None:
                     progress_callback(page_number + 1, resolved_page_count)
-        
-        # Check if extraction was successful (not all empty)
+
+        # Check if extraction was successful (has some non-empty text)
+        if any(pt.strip() for pt in page_texts):
+            return page_texts
         if any(page_texts) or not any(pt.strip() for pt in page_texts):
             return page_texts
     except Exception as pdfplumber_error:
         _write_stderr_line(f"pdfplumber extraction failed: {pdfplumber_error}")
-    
+
     # Fallback to pdfminer if pdfplumber failed
     _write_stderr_line("Falling back to pdfminer.six for text extraction...")
     high_level = importlib.import_module("pdfminer.high_level")
     layout = importlib.import_module("pdfminer.layout")
     extract_pages = cast(_ExtractPages, getattr(high_level, "extract_pages"))
     lt_text_container = cast(type[object], getattr(layout, "LTTextContainer"))
-    
+
     page_texts: list[str] = []
     page_layouts = extract_pages(str(input_pdf), maxpages=resolved_page_count)
     for page_number, page_layout in enumerate(page_layouts, start=1):
@@ -866,6 +915,30 @@ def _extract_page_count(input_pdf: Path) -> int:
     return max(1, len(pages))
 
 
+def _sample_pdf_has_extractable_text(
+    input_pdf: Path,
+    *,
+    sample_pages: int = OCR_SCAN_ONLY_SAMPLE_PAGES,
+) -> bool:
+    pypdf = importlib.import_module("pypdf")
+    pdf_reader_cls = cast(Any, getattr(pypdf, "PdfReader"))
+    pdf_reader = cast(Any, pdf_reader_cls(str(input_pdf)))
+    pages = cast(list[object], getattr(pdf_reader, "pages"))
+    inspected_pages = min(max(1, sample_pages), len(pages))
+    for page_index in range(inspected_pages):
+        page = pages[page_index]
+        extract_text = getattr(page, "extract_text", None)
+        if not callable(extract_text):
+            continue
+        try:
+            extracted_text = cast(str | None, extract_text())
+        except Exception:
+            continue
+        if isinstance(extracted_text, str) and extracted_text.strip():
+            return True
+    return False
+
+
 def _iter_page_windows(page_count: int, window_size: int) -> Iterator[tuple[int, int]]:
     bounded_page_count = max(1, page_count)
     bounded_window_size = max(1, min(window_size, OCR_PAGE_WINDOW_SIZE))
@@ -885,7 +958,9 @@ def _iter_selected_page_windows(
     run_start = sorted_indices[0]
     run_end = sorted_indices[0]
 
-    def _yield_chunked_windows(start_index: int, end_index: int) -> Iterator[tuple[int, int]]:
+    def _yield_chunked_windows(
+        start_index: int, end_index: int
+    ) -> Iterator[tuple[int, int]]:
         current = start_index
         while current <= end_index:
             chunk_end = min(end_index, current + bounded_window_size - 1)
@@ -909,11 +984,15 @@ class _OcrRuntimeTuningProfile(TypedDict):
     pdf2image_thread_count: int
 
 
-def _resolve_ocr_runtime_tuning_profile(*, extraction_workers: int) -> _OcrRuntimeTuningProfile:
+def _resolve_ocr_runtime_tuning_profile(
+    *, extraction_workers: int
+) -> _OcrRuntimeTuningProfile:
     cpu_count = os.cpu_count() or 1
     if extraction_workers <= 1:
         return {
-            "onnx_intra_op_threads": max(1, min(4, cpu_count // 2 if cpu_count > 1 else 1)),
+            "onnx_intra_op_threads": max(
+                1, min(4, cpu_count // 2 if cpu_count > 1 else 1)
+            ),
             "onnx_inter_op_threads": 1,
             "pdf2image_thread_count": max(
                 1,
@@ -963,7 +1042,9 @@ def _build_rapidocr_ocr_extractor(
                 return None
             x_val = point[0]
             y_val = point[1]
-            if not isinstance(x_val, (int, float)) or not isinstance(y_val, (int, float)):
+            if not isinstance(x_val, (int, float)) or not isinstance(
+                y_val, (int, float)
+            ):
                 return None
             points.append((float(x_val), float(y_val)))
         x_values = [point[0] for point in points]
@@ -978,7 +1059,9 @@ def _build_rapidocr_ocr_extractor(
         height = max_y - min_y
         return center_x, center_y, width, height
 
-    def _order_entries(entries: list[tuple[str, float, float, float, float]]) -> list[str]:
+    def _order_entries(
+        entries: list[tuple[str, float, float, float, float]],
+    ) -> list[str]:
         if layout_mode == OCR_LAYOUT_VERTICAL:
             ordered_entries = sorted(
                 entries,
@@ -1021,7 +1104,11 @@ def _build_rapidocr_ocr_extractor(
             text = text_value.strip()
             if not text:
                 continue
-            confidence = float(confidence_value) if isinstance(confidence_value, (int, float)) else 0.0
+            confidence = (
+                float(confidence_value)
+                if isinstance(confidence_value, (int, float))
+                else 0.0
+            )
             normalized_lines.append(
                 {
                     "text": text,
@@ -1036,24 +1123,176 @@ def _build_rapidocr_ocr_extractor(
             return ""
 
         confidence_floor = _resolve_ocr_quality_thresholds()["fallback_floor"]
-        floor_lines = [line for line in normalized_lines if line["conf"] >= confidence_floor]
+        floor_lines = [
+            line for line in normalized_lines if line["conf"] >= confidence_floor
+        ]
         if not floor_lines:
             return ""
 
-        high_conf_lines = [line for line in floor_lines if line["conf"] >= OCR_MIN_CONFIDENCE]
+        high_conf_lines = [
+            line for line in floor_lines if line["conf"] >= OCR_MIN_CONFIDENCE
+        ]
         high_conf_ratio = len(high_conf_lines) / len(floor_lines)
         selected_lines = (
-            high_conf_lines if high_conf_lines and high_conf_ratio >= OCR_HIGH_CONF_MIN_RATIO else floor_lines
+            high_conf_lines
+            if high_conf_lines and high_conf_ratio >= OCR_HIGH_CONF_MIN_RATIO
+            else floor_lines
         )
         clustered_lines = _cluster_ocr_line_metadata(selected_lines)
-        ordered_lines = _order_entries([(line["text"], *line["bbox"]) for line in clustered_lines])
+        ordered_lines = _order_entries(
+            [(line["text"], *line["bbox"]) for line in clustered_lines]
+        )
         return "\n".join(_clean_ocr_lines(ordered_lines))
+
+    return _extract
+
+
+def _list_tesseract_languages() -> set[str]:
+    completed = subprocess.run(
+        ["tesseract", "--list-langs"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return {
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip() and not line.startswith("List of available languages")
+    }
+
+
+def _resolve_tesseract_variants(layout_mode: str) -> list[tuple[str, str]]:
+    if layout_mode == OCR_LAYOUT_VERTICAL:
+        return [
+            ("kor+chi_tra_vert+chi_tra", "5"),
+        ]
+    if layout_mode == OCR_LAYOUT_HORIZONTAL:
+        return [
+            ("kor+chi_tra", "6"),
+        ]
+    return [
+        ("kor+chi_tra", "6"),
+    ]
+
+
+def _build_tesseract_ocr_extractor(
+    layout_mode: str = OCR_LAYOUT_AUTO,
+) -> _ImageToString:
+    available_languages = _list_tesseract_languages()
+    variants = [
+        (langs, psm)
+        for langs, psm in _resolve_tesseract_variants(layout_mode)
+        if all(language in available_languages for language in langs.split("+"))
+    ]
+    if not variants:
+        raise RuntimeError(
+            "Tesseract OCR requires installed language data. "
+            "Expected at least `kor` and optionally `chi_tra`/`chi_tra_vert`."
+        )
+
+    def _extract(image: object) -> str:
+        save_method = getattr(image, "save", None)
+        if not callable(save_method):
+            return ""
+
+        best_text = ""
+        best_score = 0.0
+        with tempfile.TemporaryDirectory(prefix="pdf_to_md_tesseract_") as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            cast(Callable[..., object], save_method)(str(image_path), format="PNG")
+
+            for languages, psm in variants:
+                completed = subprocess.run(
+                    [
+                        "tesseract",
+                        str(image_path),
+                        "stdout",
+                        "-l",
+                        languages,
+                        "--psm",
+                        psm,
+                        "--oem",
+                        "1",
+                        "-c",
+                        "preserve_interword_spaces=1",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                if completed.returncode != 0 or not completed.stdout.strip():
+                    continue
+                candidate_text = _normalize_page_text(completed.stdout)
+                candidate_score = _compute_page_quality_score(candidate_text)
+                if candidate_score > best_score:
+                    best_text = candidate_text
+                    best_score = candidate_score
+
+        return best_text
 
     return _extract
 
 
 def _resolve_pdf2image_thread_count(*, tuning_profile: _OcrRuntimeTuningProfile) -> int:
     return max(1, tuning_profile["pdf2image_thread_count"])
+
+
+def _build_weak_page_image_variants(
+    *, image: object, dpi: int, backend: str
+) -> list[object]:
+    if backend == "tesseract":
+        return [image]
+
+    convert_method = getattr(image, "convert", None)
+    if not callable(convert_method):
+        return [image]
+
+    pil_image_filter = importlib.import_module("PIL.ImageFilter")
+    pil_image_ops = importlib.import_module("PIL.ImageOps")
+    autocontrast = cast(
+        Callable[[object], object], getattr(pil_image_ops, "autocontrast")
+    )
+    grayscale = cast(object, convert_method("L"))
+    contrasted = cast(object, autocontrast(grayscale))
+    variants: list[object] = [image, contrasted]
+
+    filter_method = getattr(contrasted, "filter", None)
+    if callable(filter_method) and backend != "tesseract":
+        median_filter = cast(object, getattr(pil_image_filter, "MedianFilter"))(size=3)
+        sharpen_filter = cast(object, getattr(pil_image_filter, "SHARPEN"))
+        smoothed = cast(object, filter_method(median_filter))
+        variants.append(smoothed)
+        variants.append(cast(object, smoothed.filter(sharpen_filter)))
+
+    if dpi >= 280:
+        point_method = getattr(contrasted, "point", None)
+        if callable(point_method):
+            thresholds = (
+                (OCR_BINARIZATION_THRESHOLDS[-1],)
+                if backend == "tesseract"
+                else OCR_BINARIZATION_THRESHOLDS
+            )
+            for threshold in thresholds:
+                variants.append(
+                    cast(
+                        object,
+                        point_method(
+                            lambda pixel, cutoff=threshold: 255 if pixel > cutoff else 0
+                        ),
+                    )
+                )
+
+    deduped_variants: list[object] = []
+    seen_variant_ids: set[int] = set()
+    for variant in variants:
+        variant_id = id(variant)
+        if variant_id in seen_variant_ids:
+            continue
+        seen_variant_ids.add(variant_id)
+        deduped_variants.append(variant)
+    return deduped_variants
 
 
 def _extract_page_raw_texts_with_ocr(
@@ -1068,17 +1307,17 @@ def _extract_page_raw_texts_with_ocr(
     resource_guard_timeout_seconds: float = _RESOURCE_WAIT_MAX_SECONDS,
     resource_guard_fail_open: bool = _RESOURCE_WAIT_FAIL_OPEN,
 ) -> list[str]:
-    if backend != OCR_DEFAULT_ENGINE:
-        raise RuntimeError(_unimplemented_backend_message(backend))
-
     pdf2image = importlib.import_module("pdf2image")
     convert_from_path = cast(_ConvertFromPath, getattr(pdf2image, "convert_from_path"))
+    resource_guard_enabled = backend != "tesseract"
 
     if page_indices:
         windows = list(_iter_selected_page_windows(page_indices, OCR_PAGE_WINDOW_SIZE))
     else:
         resolved_page_count = (
-            page_count if page_count and page_count > 0 else _extract_page_count(input_pdf)
+            page_count
+            if page_count and page_count > 0
+            else _extract_page_count(input_pdf)
         )
         windows = list(_iter_page_windows(resolved_page_count, OCR_PAGE_WINDOW_SIZE))
 
@@ -1089,7 +1328,7 @@ def _extract_page_raw_texts_with_ocr(
         extraction_workers=extraction_workers,
     )
     cache_key = (
-        OCR_DEFAULT_ENGINE,
+        backend,
         layout_mode,
         (
             f"intra={tuning_profile['onnx_intra_op_threads']}|"
@@ -1101,10 +1340,15 @@ def _extract_page_raw_texts_with_ocr(
         image_to_string = _OCR_EXTRACTOR_CACHE.get(cache_key)
 
     if image_to_string is None:
-        image_to_string = _build_rapidocr_ocr_extractor(
-            layout_mode=layout_mode,
-            tuning_profile=tuning_profile,
-        )
+        if backend == "rapidocr":
+            image_to_string = _build_rapidocr_ocr_extractor(
+                layout_mode=layout_mode,
+                tuning_profile=tuning_profile,
+            )
+        elif backend == "tesseract":
+            image_to_string = _build_tesseract_ocr_extractor(layout_mode=layout_mode)
+        else:
+            raise RuntimeError(_unimplemented_backend_message(backend))
         if _ocr_extractor_cache_enabled:
             _OCR_EXTRACTOR_CACHE[cache_key] = image_to_string
     pdf2image_thread_count = _resolve_pdf2image_thread_count(
@@ -1115,45 +1359,31 @@ def _extract_page_raw_texts_with_ocr(
     resolved_image_to_string = image_to_string
 
     page_text_by_number: dict[int, str] = {}
-    progress_total = len(page_indices) if page_indices else max(1, sum(last - first + 1 for first, last in windows))
-
-    def _prepare_image_for_weak_page_preset(*, image: object, dpi: int) -> object:
-        if dpi <= OCR_MAX_DPI:
-            return image
-
-        pil_image_ops = importlib.import_module("PIL.ImageOps")
-        autocontrast = cast(Callable[[object], object], getattr(pil_image_ops, "autocontrast"))
-
-        convert_method = getattr(image, "convert", None)
-        if not callable(convert_method):
-            return image
-
-        grayscale = cast(object, convert_method("L"))
-        contrasted = cast(object, autocontrast(grayscale))
-        if dpi < 300:
-            return contrasted
-
-        point_method = getattr(contrasted, "point", None)
-        if not callable(point_method):
-            return contrasted
-        return cast(object, point_method(lambda pixel: 255 if pixel > 170 else 0))
+    progress_total = (
+        len(page_indices)
+        if page_indices
+        else max(1, sum(last - first + 1 for first, last in windows))
+    )
 
     def _process_window(first_page: int, last_page: int) -> list[tuple[int, str]]:
-        _wait_for_resource_headroom(
-            timeout_seconds=resource_guard_timeout_seconds,
-            fail_open=resource_guard_fail_open,
-        )
+        if resource_guard_enabled:
+            _wait_for_resource_headroom(
+                timeout_seconds=resource_guard_timeout_seconds,
+                fail_open=resource_guard_fail_open,
+            )
         expected_count = last_page - first_page + 1
         page_best_text: dict[int, str] = {}
         page_best_score: dict[int, float] = {}
 
         if page_indices:
-            render_dpis = OCR_WEAK_PAGE_PRESET_DPIS
+            render_dpis = (
+                (180,) if backend == "tesseract" else OCR_WEAK_PAGE_PRESET_DPIS
+            )
             weak_page_score_threshold = _resolve_key_content_min_page_score(
                 layout_mode=layout_mode,
             )
         else:
-            render_dpis = (OCR_MAX_DPI,)
+            render_dpis = (180,) if backend == "tesseract" else (OCR_MAX_DPI,)
             weak_page_score_threshold = 0.0
 
         for dpi_index, dpi in enumerate(render_dpis):
@@ -1190,12 +1420,27 @@ def _extract_page_raw_texts_with_ocr(
                 if image_offset >= len(images):
                     candidate_text = ""
                 else:
-                    candidate_image = _prepare_image_for_weak_page_preset(
-                        image=images[image_offset],
-                        dpi=dpi,
+                    raw_image = images[image_offset]
+                    image_variants = (
+                        _build_weak_page_image_variants(
+                            image=raw_image, dpi=dpi, backend=backend
+                        )
+                        if page_indices
+                        else [raw_image]
                     )
-                    candidate_text = resolved_image_to_string(candidate_image)
-
+                    candidate_text = ""
+                    candidate_score = 0.0
+                    for candidate_image in image_variants:
+                        variant_text = resolved_image_to_string(candidate_image)
+                        variant_score = _compute_page_quality_score(variant_text)
+                        if not candidate_text or variant_score > candidate_score:
+                            candidate_text = variant_text
+                            candidate_score = variant_score
+                        if (
+                            backend == "tesseract"
+                            and candidate_score >= OCR_TESSERACT_EARLY_ACCEPT_SCORE
+                        ):
+                            break
                 candidate_score = _compute_page_quality_score(candidate_text)
                 current_best_score = page_best_score.get(page_number)
                 if current_best_score is None or candidate_score > current_best_score:
@@ -1210,13 +1455,17 @@ def _extract_page_raw_texts_with_ocr(
 
     progress_current = 0
     if windows:
-        _wait_for_resource_headroom(
-            timeout_seconds=resource_guard_timeout_seconds,
-            fail_open=resource_guard_fail_open,
-        )
+        if resource_guard_enabled:
+            _wait_for_resource_headroom(
+                timeout_seconds=resource_guard_timeout_seconds,
+                fail_open=resource_guard_fail_open,
+            )
         with ThreadPoolExecutor(max_workers=extraction_workers) as executor:
             future_map = {
-                executor.submit(_process_window, first_page, last_page): (first_page, last_page)
+                executor.submit(_process_window, first_page, last_page): (
+                    first_page,
+                    last_page,
+                )
                 for first_page, last_page in windows
             }
             for future in as_completed(future_map):
@@ -1228,15 +1477,22 @@ def _extract_page_raw_texts_with_ocr(
                         progress_callback(progress_current, progress_total)
 
     if page_indices:
-        return [page_text_by_number.get(page_index + 1, "") for page_index in page_indices]
+        return [
+            page_text_by_number.get(page_index + 1, "") for page_index in page_indices
+        ]
 
     if not windows:
         return [""]
     max_page_number = max(last_page for _, last_page in windows)
-    return [page_text_by_number.get(page_number, "") for page_number in range(1, max_page_number + 1)]
+    return [
+        page_text_by_number.get(page_number, "")
+        for page_number in range(1, max_page_number + 1)
+    ]
 
 
-def _resolve_ocr_extraction_workers(*, window_count: int, requested_workers: int | None = None) -> int:
+def _resolve_ocr_extraction_workers(
+    *, window_count: int, requested_workers: int | None = None
+) -> int:
     if window_count <= 0:
         return 1
     return _resolve_parallel_workers(window_count, requested_workers=requested_workers)
@@ -1278,10 +1534,7 @@ def get_optional_backend_missing_dependency_message(backend: str) -> str:
     guidance = _OPTIONAL_BACKEND_GUIDANCE.get(backend)
     if guidance is None:
         return f"Unknown backend `{backend}`."
-    return (
-        f"Selected OCR backend `{backend}` is unavailable. "
-        f"{guidance}"
-    )
+    return f"Selected OCR backend `{backend}` is unavailable. {guidance}"
 
 
 def _write_stderr_line(message: str) -> None:
@@ -1293,18 +1546,26 @@ def _build_progress_event(percent: int, stage: str) -> _ProgressEvent:
     return {"percent": bounded_percent, "stage": stage}
 
 
-def _render_progress_line(event: _ProgressEvent, *, progress_format: str = PROGRESS_FORMAT_TEXT) -> str:
+def _render_progress_line(
+    event: _ProgressEvent, *, progress_format: str = PROGRESS_FORMAT_TEXT
+) -> str:
     if progress_format == PROGRESS_FORMAT_TEXT:
         return f"Progress: {event['percent']}% {event['stage']}"
     if progress_format == PROGRESS_FORMAT_JSONL:
-        return json.dumps(event, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        return json.dumps(
+            event, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        )
     raise ValueError(f"Unsupported progress format: {progress_format}")
 
 
-def _write_progress(percent: int, stage: str, *, progress_format: str | None = None) -> None:
+def _write_progress(
+    percent: int, stage: str, *, progress_format: str | None = None
+) -> None:
     event = _build_progress_event(percent, stage)
     resolved_progress_format = progress_format or _active_progress_format
-    _write_stderr_line(_render_progress_line(event, progress_format=resolved_progress_format))
+    _write_stderr_line(
+        _render_progress_line(event, progress_format=resolved_progress_format)
+    )
 
 
 def _build_page_progress_writer(
@@ -1377,7 +1638,9 @@ def _classify_pdf_failure_kind(input_pdf: Path, error: Exception) -> str | None:
     return None
 
 
-def _conversion_failed_message(error: Exception, *, input_pdf: Path | None = None) -> str:
+def _conversion_failed_message(
+    error: Exception, *, input_pdf: Path | None = None
+) -> str:
     if input_pdf is not None:
         failure_kind = _classify_pdf_failure_kind(input_pdf, error)
         if failure_kind == "encrypted":
@@ -1406,10 +1669,7 @@ def _missing_ocr_dependency_message(backend: str, missing_module: str | None) ->
 
 
 def _auto_ocr_skip_message(reason: str) -> str:
-    return (
-        "OCR auto mode could not run OCR and continued without OCR: "
-        f"{reason}"
-    )
+    return f"OCR auto mode could not run OCR and continued without OCR: {reason}"
 
 
 def _zh_script_dependency_missing_message(target_script: str) -> str:
@@ -1470,7 +1730,7 @@ def _pdfplumber_fallback_warning(error: Exception) -> str:
 
 
 def _unimplemented_backend_message(backend: str) -> str:
-    return f"Unsupported OCR backend: {backend}. Use `rapidocr`."
+    return f"Unsupported OCR backend: {backend}. Use `tesseract` or `rapidocr`."
 
 
 def _is_transient_ocr_error(error: BaseException) -> bool:
@@ -1530,7 +1790,10 @@ def _run_ocr_backend_with_transient_retry(
                 retry_count,
             )
         except (RuntimeError, OSError, TimeoutError) as error:
-            if attempt >= OCR_TRANSIENT_RETRY_MAX_ATTEMPTS or not _is_transient_ocr_error(error):
+            if (
+                attempt >= OCR_TRANSIENT_RETRY_MAX_ATTEMPTS
+                or not _is_transient_ocr_error(error)
+            ):
                 setattr(error, "_ocr_retry_count", retry_count)
                 raise
             retry_count += 1
@@ -1559,7 +1822,7 @@ def _extract_page_raw_texts_with_backend(
     resource_guard_timeout_seconds: float = _RESOURCE_WAIT_MAX_SECONDS,
     resource_guard_fail_open: bool = _RESOURCE_WAIT_FAIL_OPEN,
 ) -> list[str]:
-    if backend == "rapidocr":
+    if backend in {"rapidocr", "tesseract"}:
         if progress_callback is None:
             return _extract_page_raw_texts_with_ocr(
                 input_pdf,
@@ -1646,8 +1909,25 @@ def _resolve_project_root() -> Path:
 
 
 def _resolve_default_output_path(input_pdf: Path) -> Path:
-    downloads_dir = _resolve_project_root() / _DEFAULT_DOWNLOADS_DIR_NAME / input_pdf.stem
+    downloads_dir = (
+        _resolve_project_root() / _DEFAULT_DOWNLOADS_DIR_NAME / input_pdf.stem
+    )
     return downloads_dir / f"{input_pdf.stem}.md"
+
+
+def _resolve_output_path_from_dir(output_dir: str, input_pdf: Path) -> str:
+    """Resolve output path from output directory.
+
+    Args:
+        output_dir: Directory to place output in.
+        input_pdf: Path to input PDF file.
+
+    Returns:
+        Path to output markdown file as string.
+    """
+    output_dir_path = Path(output_dir)
+    output_file = output_dir_path / input_pdf.stem / f"{input_pdf.stem}.md"
+    return str(output_file)
 
 
 def _positive_int(value: str) -> int:
@@ -1680,7 +1960,9 @@ def _iter_page_chunks(
         yield (start_page, end_page, page_texts[start_index:end_index])
 
 
-def _iter_page_ranges(total_pages: int, pages_per_chunk: int) -> Iterator[tuple[int, int]]:
+def _iter_page_ranges(
+    total_pages: int, pages_per_chunk: int
+) -> Iterator[tuple[int, int]]:
     chunk_size = max(1, pages_per_chunk)
     bounded_total = max(1, total_pages)
     for start_page in range(1, bounded_total + 1, chunk_size):
@@ -1751,14 +2033,19 @@ def _run_split_before_ocr_conversion(
             temp_root = Path(temp_dir)
             chunk_jobs: list[tuple[int, int, int, Path]] = []
             for chunk_index, (start_page, end_page) in enumerate(chunk_ranges, start=1):
-                chunk_output = _build_chunk_output_path(output_base, start_page, end_page)
+                chunk_output = _build_chunk_output_path(
+                    output_base, start_page, end_page
+                )
                 if chunk_output.exists() and not force:
                     _write_stderr_line(
                         f"Output file already exists: {chunk_output}. Use --force to overwrite."
                     )
                     return 1
 
-                split_pdf = temp_root / f"split_{chunk_index:04d}_{start_page:04d}_{end_page:04d}.pdf"
+                split_pdf = (
+                    temp_root
+                    / f"split_{chunk_index:04d}_{start_page:04d}_{end_page:04d}.pdf"
+                )
                 _write_pdf_page_chunk(
                     source_pages=source_pages,
                     output_pdf=split_pdf,
@@ -1797,7 +2084,9 @@ def _run_split_before_ocr_conversion(
                 }
                 return _execute_conversion(**execute_kwargs)
 
-            def _write_chunk_progress(*, chunk_index: int, start_page: int, end_page: int) -> None:
+            def _write_chunk_progress(
+                *, chunk_index: int, start_page: int, end_page: int
+            ) -> None:
                 _write_progress(
                     95,
                     (
@@ -1809,8 +2098,12 @@ def _run_split_before_ocr_conversion(
 
             def _run_serial_chunk_loop() -> int:
                 for chunk_index, start_page, end_page, split_pdf in chunk_jobs:
-                    chunk_output = _build_chunk_output_path(output_base, start_page, end_page)
-                    exit_code = _run_single_chunk(split_pdf=split_pdf, chunk_output=chunk_output)
+                    chunk_output = _build_chunk_output_path(
+                        output_base, start_page, end_page
+                    )
+                    exit_code = _run_single_chunk(
+                        split_pdf=split_pdf, chunk_output=chunk_output
+                    )
                     if exit_code != 0:
                         return exit_code
                     _write_chunk_progress(
@@ -1895,9 +2188,7 @@ def _resolve_chunk_output_base(output_path: Path, input_pdf: Path) -> Path:
 
 
 def _build_chunk_output_path(base_path: Path, start_page: int, end_page: int) -> Path:
-    return base_path.with_name(
-        f"{base_path.name}_p{start_page:04d}-{end_page:04d}.md"
-    )
+    return base_path.with_name(f"{base_path.name}_p{start_page:04d}-{end_page:04d}.md")
 
 
 def _compute_parallel_workers(total_tasks: int) -> int:
@@ -1920,7 +2211,9 @@ def _compute_parallel_workers(total_tasks: int) -> int:
     return max(1, min(total_tasks, workers))
 
 
-def _resolve_parallel_workers(total_tasks: int, requested_workers: int | None = None) -> int:
+def _resolve_parallel_workers(
+    total_tasks: int, requested_workers: int | None = None
+) -> int:
     resolved_workers = _compute_parallel_workers(total_tasks)
     if requested_workers is None:
         return resolved_workers
@@ -1995,7 +2288,9 @@ def _memory_budget_worker_cap(total_tasks: int) -> int | None:
 
     budget_bytes = int(total_bytes * (_RESOURCE_USAGE_LIMIT - current_ratio))
     process_rss = _current_process_rss_bytes()
-    estimated_per_worker = max(64 * 1024 * 1024, process_rss // max(1, os.cpu_count() or 1))
+    estimated_per_worker = max(
+        64 * 1024 * 1024, process_rss // max(1, os.cpu_count() or 1)
+    )
     if estimated_per_worker <= 0:
         return None
     return max(1, min(total_tasks, budget_bytes // estimated_per_worker))
@@ -2036,7 +2331,9 @@ def _wait_for_resource_headroom(
                 f"limit={int(_RESOURCE_USAGE_LIMIT * 100)}%"
             )
             if fail_open:
-                _write_stderr_line(f"{timeout_message} continuing with fail-open policy")
+                _write_stderr_line(
+                    f"{timeout_message} continuing with fail-open policy"
+                )
                 break
             raise RuntimeError(timeout_message)
         if elapsed_seconds - last_heartbeat_seconds >= _RESOURCE_WAIT_HEARTBEAT_SECONDS:
@@ -2074,7 +2371,9 @@ def _run_ocr_fallback_pipeline(
         layout_mode=layout_mode,
     )
 
-    weak_pages_before_pdfplumber = sum(1 for page_text in page_texts if _is_weak_page_text(page_text))
+    weak_pages_before_pdfplumber = sum(
+        1 for page_text in page_texts if _is_weak_page_text(page_text)
+    )
     _write_progress(
         45,
         (
@@ -2089,7 +2388,9 @@ def _run_ocr_fallback_pipeline(
     )
 
     weak_page_indices = [
-        index for index, page_text in enumerate(merged_page_texts) if _is_weak_page_text(page_text)
+        index
+        for index, page_text in enumerate(merged_page_texts)
+        if _is_weak_page_text(page_text)
     ]
     weak_pages_after_pdfplumber = len(weak_page_indices)
     ocr_pages_requested = len(weak_page_indices)
@@ -2100,10 +2401,7 @@ def _run_ocr_fallback_pipeline(
     if weak_page_indices:
         _write_progress(
             60,
-            (
-                "running ocr "
-                f"backend={requested_engine} pages={ocr_pages_requested}"
-            ),
+            (f"running ocr backend={requested_engine} pages={ocr_pages_requested}"),
         )
         ocr_page_progress_writer = _build_page_progress_writer(
             stage_label="ocr page progress",
@@ -2145,7 +2443,9 @@ def _run_ocr_fallback_pipeline(
                 resource_guard_fail_open=resource_guard_fail_open,
             )
         except ModuleNotFoundError as error:
-            missing_dependency_message = _missing_ocr_dependency_message(requested_engine, error.name)
+            missing_dependency_message = _missing_ocr_dependency_message(
+                requested_engine, error.name
+            )
             if strict_mode:
                 _write_stderr_line(missing_dependency_message)
             else:
@@ -2231,10 +2531,8 @@ def _render_chunk_markdown_text(
     resource_guard_timeout_seconds: float = _RESOURCE_WAIT_MAX_SECONDS,
     resource_guard_fail_open: bool = _RESOURCE_WAIT_FAIL_OPEN,
 ) -> str:
-    _wait_for_resource_headroom(
-        timeout_seconds=resource_guard_timeout_seconds,
-        fail_open=resource_guard_fail_open,
-    )
+    _ = resource_guard_timeout_seconds
+    _ = resource_guard_fail_open
     return "".join(
         format_markdown_pages_streaming(
             chunk_page_texts,
@@ -2294,9 +2592,13 @@ def _apply_selective_pdfplumber_route(
     diagnostics_writer: Callable[[str], None] | None = None,
 ) -> list[str]:
     weak_page_indices = [
-        index for index, page_text in enumerate(page_texts) if _is_weak_page_text(page_text)
+        index
+        for index, page_text in enumerate(page_texts)
+        if _is_weak_page_text(page_text)
     ]
-    selected_indices = weak_page_indices  # Removed limit: pdfplumber now primary extractor
+    selected_indices = (
+        weak_page_indices  # Removed limit: pdfplumber now primary extractor
+    )
     if not selected_indices:
         return page_texts
 
@@ -2322,13 +2624,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract text from a PDF and write markdown output."
     )
-    _ = parser.add_argument("input_pdf", nargs="?", help="Path to the input PDF file")
-    _ = parser.add_argument(
+    _ = parser.add_argument("input_pdf", nargs="?", help="Path to input PDF file")
+    output_group = parser.add_mutually_exclusive_group()
+    _ = output_group.add_argument(
         "-o",
         "--output",
         help=(
             "Path to output markdown file "
             "(default: <project_root>/downloads/<input_stem>/<input_stem>.md)"
+        ),
+    )
+    _ = output_group.add_argument(
+        "--output-dir",
+        help=(
+            "Path to output directory "
+            "(creates <output_dir>/<input_stem>/<input_stem>.md)"
         ),
     )
     split_group = parser.add_mutually_exclusive_group()
@@ -2408,7 +2718,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = parser.add_argument(
         "--ocr-engine",
         default=OCR_DEFAULT_ENGINE,
-        choices=("rapidocr",),
+        choices=("tesseract", "rapidocr"),
         help="Select OCR backend when --ocr-fallback is active.",
     )
     _ = parser.add_argument(
@@ -2454,7 +2764,9 @@ def _apply_zh_script_conversion(
     try:
         opencc_module = importlib.import_module("opencc")
     except ModuleNotFoundError as error:
-        raise RuntimeError(_zh_script_dependency_missing_message(target_script)) from error
+        raise RuntimeError(
+            _zh_script_dependency_missing_message(target_script)
+        ) from error
 
     opencc_cls = getattr(opencc_module, "OpenCC", None)
     if not callable(opencc_cls):
@@ -2469,7 +2781,11 @@ def _apply_zh_script_conversion(
     changed_pages = 0
     for page_text in page_texts:
         converted_text_raw = cast(object, convert_callable(page_text))
-        converted_text = converted_text_raw if isinstance(converted_text_raw, str) else str(converted_text_raw)
+        converted_text = (
+            converted_text_raw
+            if isinstance(converted_text_raw, str)
+            else str(converted_text_raw)
+        )
         converted_pages.append(converted_text)
         if converted_text != page_text:
             changed_pages += 1
@@ -2533,22 +2849,18 @@ def _resolve_wizard_options(
     resolved_ocr_engine = OCR_DEFAULT_ENGINE
 
     if resolved_ocr_fallback:
-        _write_stderr_line("OCR backend is fixed to rapidocr.")
+        _write_stderr_line(f"OCR backend default is {OCR_DEFAULT_ENGINE}.")
     else:
         resolved_ocr_fallback = _prompt_yes_no(
             "Enable OCR fallback anyway? [y/N]: ",
             default=False,
         )
         if resolved_ocr_fallback:
-            _write_stderr_line("OCR backend is fixed to rapidocr.")
+            _write_stderr_line(f"OCR backend default is {OCR_DEFAULT_ENGINE}.")
             resolved_ocr_engine = OCR_DEFAULT_ENGINE
 
     resolved_input_pdf = _prompt_text(
-        (
-            f"Input PDF path [{input_pdf}]: "
-            if input_pdf
-            else "Input PDF path: "
-        ),
+        (f"Input PDF path [{input_pdf}]: " if input_pdf else "Input PDF path: "),
         input_pdf,
     )
 
@@ -2587,11 +2899,7 @@ def _resolve_ctl_options(
     force: bool,
 ) -> tuple[str, str | None, bool, str, str, str, bool]:
     resolved_input_pdf = _prompt_text(
-        (
-            f"Input PDF path [{input_pdf}]: "
-            if input_pdf
-            else "Input PDF path: "
-        ),
+        (f"Input PDF path [{input_pdf}]: " if input_pdf else "Input PDF path: "),
         input_pdf,
     )
 
@@ -2624,7 +2932,7 @@ def _resolve_ctl_options(
     resolved_engine = OCR_DEFAULT_ENGINE
     resolved_layout = OCR_LAYOUT_AUTO
     if ocr_mode in ("strict", "auto"):
-        _write_stderr_line("OCR backend is fixed to rapidocr.")
+        _write_stderr_line(f"OCR backend default is {OCR_DEFAULT_ENGINE}.")
         resolved_layout = _prompt_choice(
             "OCR layout [auto/vertical/horizontal] (default: auto): ",
             (OCR_LAYOUT_AUTO, OCR_LAYOUT_VERTICAL, OCR_LAYOUT_HORIZONTAL),
@@ -2726,7 +3034,9 @@ def _execute_conversion(
         )
 
     input_pdf = Path(input_pdf_arg)
-    output_path = Path(output_arg) if output_arg else _resolve_default_output_path(input_pdf)
+    output_path = (
+        Path(output_arg) if output_arg else _resolve_default_output_path(input_pdf)
+    )
     chunk_size = split_every_arg if split_every_arg is not None else split_preset_arg
 
     if not input_pdf.exists() or not input_pdf.is_file():
@@ -2748,8 +3058,20 @@ def _execute_conversion(
             f"Output file already exists: {output_path}. Use --force to overwrite."
         )
         return 1
+    
+    if not output_path.parent.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_stderr_line(f"📂 출력 디렉토리가 없어 새로 생성했습니다: {output_path.parent}")
+        _write_stderr_line(f"💡 해당 디렉토리에 결과물이 저장될 예정입니다.")
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_stderr_line(
+            f"📂 출력 디렉토리가 없어 새로 생성했습니다: {output_path.parent}"
+        )
+        _write_stderr_line(f"💡 해당 디렉토리에 결과물이 저장될 예정입니다.")
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     previous_progress_format = _active_progress_format
     _active_progress_format = progress_format_arg
@@ -2827,11 +3149,22 @@ def _execute_conversion(
                 )
             return split_exit_code
 
-        page_texts = extract_page_texts(
-            input_pdf,
-            max_pages=max_pages_arg,
-            progress_callback=native_page_progress_writer,
+        skip_native_extraction = (
+            ocr_fallback_enabled and not _sample_pdf_has_extractable_text(input_pdf)
         )
+        if skip_native_extraction:
+            total_pages = estimated_page_count
+            page_texts = ["" for _ in range(total_pages)]
+            _write_stderr_line(
+                "Diagnostics: mode=scan_detect native_extraction=skipped "
+                f"sample_pages={OCR_SCAN_ONLY_SAMPLE_PAGES} estimated_pages={total_pages}"
+            )
+        else:
+            page_texts = extract_page_texts(
+                input_pdf,
+                max_pages=max_pages_arg,
+                progress_callback=native_page_progress_writer,
+            )
         stage_seconds["native"] = time.monotonic() - native_started_at
         _write_progress(35, f"native extraction complete pages={len(page_texts)}")
 
@@ -2880,13 +3213,11 @@ def _execute_conversion(
             parallel_workers = _resolve_parallel_workers(
                 total_pages, requested_workers=workers_arg
             )
-            internal_chunk_size = max(1, (total_pages + parallel_workers - 1) // parallel_workers)
+            internal_chunk_size = max(
+                1, (total_pages + parallel_workers - 1) // parallel_workers
+            )
             internal_chunks = list(_iter_page_chunks(page_texts, internal_chunk_size))
             rendered_chunk_map: dict[int, str] = {}
-            _wait_for_resource_headroom(
-                timeout_seconds=resource_guard_timeout_seconds_arg,
-                fail_open=resource_guard_fail_open,
-            )
             with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
                 future_map = {
                     executor.submit(
@@ -2896,7 +3227,11 @@ def _execute_conversion(
                         resource_guard_timeout_seconds=resource_guard_timeout_seconds_arg,
                         resource_guard_fail_open=resource_guard_fail_open,
                     ): chunk_index
-                    for chunk_index, (start_page, _end_page, chunk_page_texts) in enumerate(
+                    for chunk_index, (
+                        start_page,
+                        _end_page,
+                        chunk_page_texts,
+                    ) in enumerate(
                         internal_chunks,
                         start=1,
                     )
@@ -2921,20 +3256,20 @@ def _execute_conversion(
                 chunked_pages,
                 start=1,
             ):
-                chunk_output = _build_chunk_output_path(output_base, start_page, end_page)
+                chunk_output = _build_chunk_output_path(
+                    output_base, start_page, end_page
+                )
                 if chunk_output.exists() and not force_arg:
                     _write_stderr_line(
                         f"Output file already exists: {chunk_output}. Use --force to overwrite."
                     )
                     return 1
-                chunk_jobs.append((chunk_index, start_page, end_page, chunk_output, chunk_page_texts))
+                chunk_jobs.append(
+                    (chunk_index, start_page, end_page, chunk_output, chunk_page_texts)
+                )
 
             parallel_workers = _resolve_parallel_workers(
                 len(chunk_jobs), requested_workers=workers_arg
-            )
-            _wait_for_resource_headroom(
-                timeout_seconds=resource_guard_timeout_seconds_arg,
-                fail_open=resource_guard_fail_open,
             )
             with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
                 future_map = {
@@ -3003,6 +3338,7 @@ def main(argv: list[str] | None = None) -> int:
 
     input_pdf_arg = getattr(args, "input_pdf", None)
     output_arg = getattr(args, "output", None)
+    output_dir_arg = getattr(args, "output_dir", None)
     force_arg = getattr(args, "force", False)
     wizard_arg = getattr(args, "wizard", False)
     ctl_arg = getattr(args, "ctl", False)
@@ -3010,8 +3346,12 @@ def main(argv: list[str] | None = None) -> int:
     ocr_mode_arg = getattr(args, "ocr", None)
     ocr_engine_arg = getattr(args, "ocr_engine", OCR_DEFAULT_ENGINE)
     ocr_layout_arg = getattr(args, "ocr_layout", OCR_LAYOUT_AUTO)
-    ocr_classical_zh_postprocess_arg = getattr(args, "ocr_classical_zh_postprocess", False)
-    ocr_key_content_fallback_arg = bool(getattr(args, "ocr_key_content_fallback", False))
+    ocr_classical_zh_postprocess_arg = getattr(
+        args, "ocr_classical_zh_postprocess", False
+    )
+    ocr_key_content_fallback_arg = bool(
+        getattr(args, "ocr_key_content_fallback", False)
+    )
     zh_script_arg = getattr(args, "zh_script", ZH_SCRIPT_KEEP)
     max_pages_arg = getattr(args, "max_pages", None)
     workers_arg = getattr(args, "workers", None)
@@ -3051,6 +3391,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if output_arg is not None and not isinstance(output_arg, str):
         _write_stderr_line("Invalid output argument.")
+        return 1
+    if output_dir_arg is not None and not isinstance(output_dir_arg, str):
+        _write_stderr_line("Invalid output directory argument.")
         return 1
     if not isinstance(force_arg, bool):
         _write_stderr_line("Invalid force argument.")
@@ -3161,6 +3504,9 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(input_pdf_arg, str) or not input_pdf_arg.strip():
         _write_stderr_line("Invalid input argument.")
         return 1
+
+    if output_dir_arg is not None:
+        output_arg = _resolve_output_path_from_dir(output_dir_arg, Path(input_pdf_arg))
 
     return _execute_conversion(
         input_pdf_arg=input_pdf_arg,

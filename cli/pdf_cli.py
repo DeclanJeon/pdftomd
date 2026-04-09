@@ -38,8 +38,13 @@ _PROGRESS_INTERVAL_DEFAULT_SECONDS = 1.0
 _PROGRESS_INTERVAL_MIN_SECONDS = 0.2
 _LIVE_MONITOR_MAX_SECONDS = 60.0 * 60.0
 _LIVE_MONITOR_TERMINATE_GRACE_SECONDS = 5.0
+_OCR_AUTO_ENABLE_SAMPLE_PAGES = 3
+_OCR_AUTO_ENABLE_LARGE_SCAN_PAGE_THRESHOLD = 120
+_OCR_AUTO_ENABLE_LARGE_SCAN_SPLIT_PRESET = 50
+_OCR_SCANLIKE_RECOMMENDED_ENGINE = "tesseract"
 _ENV_MAP: dict[str, str] = {
     "output": "PDF_TO_MD_OUTPUT",
+    "output_dir": "PDF_TO_MD_OUTPUT_DIR",
     "force": "PDF_TO_MD_FORCE",
     "ocr_mode": "PDF_TO_MD_OCR_MODE",
     "ocr_engine": "PDF_TO_MD_OCR_ENGINE",
@@ -54,6 +59,7 @@ _ENV_MAP: dict[str, str] = {
 }
 _OPTION_KEYS: tuple[str, ...] = (
     "output",
+    "output_dir",
     "force",
     "ocr_mode",
     "ocr_engine",
@@ -68,7 +74,7 @@ _OPTION_KEYS: tuple[str, ...] = (
 _DEFAULTS: dict[str, object] = {
     "force": False,
     "ocr_mode": "off",
-    "ocr_engine": "rapidocr",
+    "ocr_engine": "tesseract",
     "ocr_layout": "auto",
     "zh_script": "keep",
     "classical_zh_postprocess": False,
@@ -124,6 +130,32 @@ class CliRuntimeValidationError(ValueError):
     pass
 
 
+class _AutoOcrRecommendation:
+    enable_strict_ocr: bool
+    split_preset: int | None
+    page_count: int
+    sample_pages_checked: int
+    dependency_missing: list[str]
+    recommended_engine: str
+
+    def __init__(
+        self,
+        *,
+        enable_strict_ocr: bool,
+        split_preset: int | None,
+        page_count: int,
+        sample_pages_checked: int,
+        dependency_missing: list[str],
+        recommended_engine: str,
+    ) -> None:
+        self.enable_strict_ocr = enable_strict_ocr
+        self.split_preset = split_preset
+        self.page_count = page_count
+        self.sample_pages_checked = sample_pages_checked
+        self.dependency_missing = dependency_missing
+        self.recommended_engine = recommended_engine
+
+
 def _coerce_bool(raw_value: object, context: str) -> bool:
     if isinstance(raw_value, bool):
         return raw_value
@@ -149,7 +181,7 @@ def _coerce_engine(raw_value: object, context: str) -> str:
     if not isinstance(raw_value, str):
         raise CliRuntimeValidationError(f"Invalid ocr_engine for {context}: {raw_value!r}")
     value = raw_value.strip().lower()
-    if value == "rapidocr":
+    if value in {"rapidocr", "tesseract"}:
         return value
     raise CliRuntimeValidationError(f"Invalid ocr_engine for {context}: {raw_value!r}")
 
@@ -173,7 +205,7 @@ def _coerce_zh_script(raw_value: object, context: str) -> str:
 
 
 def _normalize_option_value(key: str, raw_value: object, context: str) -> object:
-    if key in {"output", "profile"}:
+    if key in {"output", "output_dir", "profile"}:
         if not isinstance(raw_value, str):
             raise CliRuntimeValidationError(f"Invalid {key} for {context}: {raw_value!r}")
         value = raw_value.strip()
@@ -269,7 +301,7 @@ def _default_config_payload() -> dict[str, object]:
             "default": {
                 "force": False,
                 "ocr_mode": "off",
-                "ocr_engine": "rapidocr",
+                "ocr_engine": "tesseract",
                 "ocr_layout": "auto",
                 "zh_script": "keep",
                 "classical_zh_postprocess": False,
@@ -338,6 +370,7 @@ def _validate_config_payload(payload: dict[str, object]) -> None:
 def _parse_convert_cli(argv: list[str]) -> tuple[dict[str, object], str, float]:
     parser = argparse.ArgumentParser(add_help=False)
     _ = parser.add_argument("-o", "--output")
+    _ = parser.add_argument("--output-dir")
     _ = parser.add_argument("--force", action="store_true")
     _ = parser.add_argument("--ocr-fallback", action="store_true")
     _ = parser.add_argument("--ocr")
@@ -359,6 +392,11 @@ def _parse_convert_cli(argv: list[str]) -> tuple[dict[str, object], str, float]:
     output_value = cast(str | None, parsed.output)
     if output_value is not None:
         cli_values["output"] = _normalize_option_value("output", output_value, "cli")
+    output_dir_value = cast(str | None, parsed.output_dir)
+    if output_value is not None and output_dir_value is not None:
+        raise CliRuntimeValidationError("Choose only one: --output or --output-dir.")
+    if output_dir_value is not None:
+        cli_values["output_dir"] = _normalize_option_value("output_dir", output_dir_value, "cli")
     if cast(bool, parsed.force):
         cli_values["force"] = True
     if cast(bool, parsed.ocr_fallback):
@@ -543,6 +581,11 @@ def _augment_legacy_argv_from_effective(
         output_value = resolved.get("output")
         if isinstance(output_value, str):
             final_argv.extend(["-o", output_value])
+
+    if "output_dir" not in cli_values:
+        output_dir_value = resolved.get("output_dir")
+        if isinstance(output_dir_value, str):
+            final_argv.extend(["--output-dir", output_dir_value])
 
     if "force" not in cli_values and bool(resolved.get("force", False)):
         final_argv.append("--force")
@@ -794,8 +837,83 @@ def _resolve_missing_ocr_runtime_requirements(engine: str) -> list[str]:
         if shutil.which("pdftoppm") is None:
             missing.append("system binary `pdftoppm` (install poppler-utils)")
         return missing
+    if engine == "tesseract":
+        if shutil.which("tesseract") is None:
+            missing.append("system binary `tesseract`")
+            return missing
+        try:
+            completed = subprocess.run(
+                ["tesseract", "--list-langs"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except Exception:
+            missing.append("tesseract language data lookup")
+            return missing
+        installed_languages = {
+            line.strip()
+            for line in completed.stdout.splitlines()
+            if line.strip() and not line.startswith("List of available languages")
+        }
+        if "kor" not in installed_languages:
+            missing.append("tesseract language data `kor`")
+        return missing
 
     return missing
+
+
+def _sample_pdf_has_extractable_text(input_pdf: Path, *, sample_pages: int) -> tuple[bool, int]:
+    pypdf = importlib.import_module("pypdf")
+    pdf_reader_cls = cast(object, getattr(pypdf, "PdfReader"))
+    pdf_reader = cast(object, pdf_reader_cls(str(input_pdf)))
+    pages = cast(list[object], getattr(pdf_reader, "pages"))
+    inspected_pages = min(max(1, sample_pages), len(pages))
+    for page_index in range(inspected_pages):
+        page = pages[page_index]
+        extract_text = getattr(page, "extract_text", None)
+        if not callable(extract_text):
+            continue
+        try:
+            extracted_text = cast(str | None, extract_text())
+        except Exception:
+            continue
+        if isinstance(extracted_text, str) and extracted_text.strip():
+            return True, inspected_pages
+    return False, inspected_pages
+
+
+def _recommend_auto_ocr_defaults(
+    input_pdf: Path,
+    *,
+    resolved_ocr_engine: str,
+    sample_pages: int = _OCR_AUTO_ENABLE_SAMPLE_PAGES,
+) -> _AutoOcrRecommendation:
+    page_count = max(1, pdf_to_md._extract_page_count(input_pdf))
+    recommended_engine = _OCR_SCANLIKE_RECOMMENDED_ENGINE
+    dependency_missing = _resolve_missing_ocr_runtime_requirements(recommended_engine)
+    if dependency_missing:
+        recommended_engine = resolved_ocr_engine
+        dependency_missing = _resolve_missing_ocr_runtime_requirements(recommended_engine)
+    has_extractable_text, sample_pages_checked = _sample_pdf_has_extractable_text(
+        input_pdf,
+        sample_pages=sample_pages,
+    )
+
+    enable_strict_ocr = (not has_extractable_text) and (not dependency_missing)
+    split_preset: int | None = None
+    if enable_strict_ocr and page_count >= _OCR_AUTO_ENABLE_LARGE_SCAN_PAGE_THRESHOLD:
+        split_preset = _OCR_AUTO_ENABLE_LARGE_SCAN_SPLIT_PRESET
+
+    return _AutoOcrRecommendation(
+        enable_strict_ocr=enable_strict_ocr,
+        split_preset=split_preset,
+        page_count=page_count,
+        sample_pages_checked=sample_pages_checked,
+        dependency_missing=dependency_missing,
+        recommended_engine=recommended_engine,
+    )
 
 
 def _resolve_interactive_ocr_mode_after_dependency_check(
@@ -969,10 +1087,10 @@ def _run_interactive_no_arg_launcher() -> int:
     )
     ocr_mode = ["off", "strict", "auto"][ocr_mode_index]
 
-    ocr_engine = "rapidocr"
+    ocr_engine = _OCR_SCANLIKE_RECOMMENDED_ENGINE
     ocr_layout = "auto"
     if ocr_mode in {"strict", "auto"}:
-        _write_stderr_line("OCR engine is fixed to rapidocr.")
+        _write_stderr_line(f"OCR engine default is {ocr_engine}.")
         layout_index = _prompt_numbered_choice(
             "Select OCR layout",
             ["auto", "vertical", "horizontal"],
@@ -1774,11 +1892,57 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "convert":
             cli_values, progress_detail, progress_interval_seconds = _parse_convert_cli(remainder)
-            _, resolved, _, selected_profile = _build_effective_state(
+            _, resolved, source, selected_profile = _build_effective_state(
                 cli_values=cli_values,
                 selected_profile=cast(str | None, cli_values.get("profile")),
             )
             _ = selected_profile
+            input_pdf_token = next(
+                (
+                    token
+                    for token in remainder
+                    if token
+                    and not token.startswith("-")
+                    and token != cast(str | None, cli_values.get("profile"))
+                ),
+                None,
+            )
+            if (
+                isinstance(input_pdf_token, str)
+                and source.get("ocr_mode") == "default"
+                and source.get("split_preset") == "default"
+                and source.get("split_every") == "default"
+            ):
+                recommendation = _recommend_auto_ocr_defaults(
+                    Path(input_pdf_token),
+                    resolved_ocr_engine=cast(str, resolved["ocr_engine"]),
+                )
+                if recommendation.enable_strict_ocr:
+                    resolved["ocr_mode"] = "strict"
+                    source["ocr_mode"] = "auto-detected"
+                    resolved["ocr_engine"] = recommendation.recommended_engine
+                    source["ocr_engine"] = "auto-detected"
+                    if recommendation.split_preset is not None:
+                        resolved["split_preset"] = recommendation.split_preset
+                        source["split_preset"] = "auto-detected"
+                    _write_stderr_line(
+                        "Auto-enabled OCR strict mode for scan-like PDF "
+                        f"(sample_pages={recommendation.sample_pages_checked} "
+                        f"page_count={recommendation.page_count}"
+                        f" engine={recommendation.recommended_engine}"
+                        + (
+                            f" split_preset={recommendation.split_preset}"
+                            if recommendation.split_preset is not None
+                            else ""
+                        )
+                        + ")."
+                    )
+                elif recommendation.dependency_missing:
+                    _write_stderr_line(
+                        "Detected scan-like PDF without extractable text, but OCR auto-enable was skipped "
+                        "because required OCR dependencies are missing: "
+                        + ", ".join(recommendation.dependency_missing)
+                    )
             sanitized_remainder = _strip_wrapper_progress_flags(remainder)
             forwarded_argv = _augment_legacy_argv_from_effective(
                 original_argv=sanitized_remainder,

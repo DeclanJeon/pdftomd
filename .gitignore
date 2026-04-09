@@ -1,12 +1,54 @@
-report/
-.sisyphus/
-output/
-downloads/
-resource/
-.venv/
+# Git Ignore for PDF to Markdown CLI
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
-.pdf-to-md.json
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+.env.local
+
+# Tests
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+.cache
+
+# Project Specific
+output/
+report/
+resource/
+.sisyphus/
+cli/venv/
+cli/build/
+cli/__pycache__/
+cli/*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
