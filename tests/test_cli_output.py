@@ -63,23 +63,25 @@ def test_custom_output_directory_with_cli_arg():
         custom_output_dir = tmpdir_path / "custom_output"
         custom_output_dir.mkdir()
 
-        # Run pdftomd convert with --output-dir argument
-        # Note: This test will FAIL initially until the feature is implemented
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pdf_cli",
-                "convert",
-                str(test_pdf),
-                "--output-dir",
-                str(custom_output_dir),
-                "--force",
-            ],
-            cwd="/home/declan/Documents/00_Develop/pdftomd2/cli",
-            capture_output=True,
-            text=True,
-        )
+    # Run pdftomd convert with --output-dir argument
+    # Note: This test will FAIL initially until the feature is implemented
+    cli_dir = Path(__file__).resolve().parents[1] / "cli"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pdf_cli",
+            "convert",
+            str(test_pdf),
+            "--output-dir",
+            str(custom_output_dir),
+            "--force",
+        ],
+        cwd=str(cli_dir),
+        capture_output=True,
+        text=True,
+    )
+
 
         # The test expects that the output file is created in the custom_output_dir
         # Expected output path: custom_output_dir/test/test.md
@@ -116,7 +118,7 @@ def test_default_downloads_directory_when_no_output_arg():
         create_test_pdf(test_pdf, "Test PDF for default downloads directory")
 
         # Change to cli directory to run pdftomd
-        cli_dir = Path("/home/declan/Documents/00_Develop/pdftomd2/cli")
+        cli_dir = Path(__file__).resolve().parents[1] / "cli"
 
         # Run pdftomd convert without any output argument
         result = subprocess.run(
@@ -171,6 +173,7 @@ def test_text_extraction_on_readable_pdf():
         c.save()
 
         # Run pdftomd convert with OCR disabled
+        cli_dir = Path(__file__).resolve().parents[1] / "cli"
         result = subprocess.run(
             [
                 sys.executable,
@@ -180,13 +183,14 @@ def test_text_extraction_on_readable_pdf():
                 str(test_pdf),
                 "--force",
             ],
-            cwd="/home/declan/Documents/00_Develop/pdftomd2/cli",
+            cwd=str(cli_dir),
             capture_output=True,
             text=True,
         )
 
         # Get the output path
-        project_root = Path("/home/declan/Documents/00_Develop/pdftomd2/cli").parent
+        cli_dir = Path(__file__).resolve().parents[1] / "cli"
+        project_root = cli_dir.parent
         output_path = project_root / "downloads" / "test_text" / "test_text.md"
 
         assert result.returncode == 0, (
@@ -256,7 +260,7 @@ def test_convert_auto_enables_ocr_for_scan_like_pdf():
                 str(output_path),
                 "--force",
             ],
-            cwd="/home/declan/Documents/00_Develop/pdftomd2/cli",
+            cwd=str(Path(__file__).resolve().parents[1] / "cli"),
             capture_output=True,
             text=True,
         )
