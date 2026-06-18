@@ -621,7 +621,7 @@ def _should_replace_page_with_ocr(
     thresholds = _resolve_ocr_quality_thresholds(quality_thresholds)
     ocr_score = _compute_page_quality_score(normalized_ocr_text)
     if not _normalize_page_text(baseline_text):
-        return ocr_score >= thresholds["fallback_floor"]
+        return bool(_build_key_content_lines(normalized_ocr_text)) or ocr_score >= thresholds["fallback_floor"]
 
     baseline_score = _compute_page_quality_score(baseline_text)
     return ocr_score >= baseline_score + thresholds["replacement_margin"]
@@ -1080,7 +1080,14 @@ def _build_rapidocr_ocr_extractor(
             return ""
 
         try:
-            ocr_result = cast(object, ocr_callable(image))
+            numpy = importlib.import_module("numpy")
+            image_input = numpy.asarray(
+                image.convert("RGB") if hasattr(image, "convert") else image
+            )
+        except Exception:
+            image_input = image
+        try:
+            ocr_result = cast(object, ocr_callable(image_input))
         except Exception:
             return ""
 
@@ -1104,11 +1111,14 @@ def _build_rapidocr_ocr_extractor(
             text = text_value.strip()
             if not text:
                 continue
-            confidence = (
-                float(confidence_value)
-                if isinstance(confidence_value, (int, float))
-                else 0.0
-            )
+            try:
+                confidence = (
+                    float(confidence_value)
+                    if isinstance(confidence_value, (int, float, str))
+                    else 0.0
+                )
+            except (TypeError, ValueError):
+                confidence = 0.0
             normalized_lines.append(
                 {
                     "text": text,
@@ -1165,14 +1175,21 @@ def _list_tesseract_languages() -> set[str]:
 def _resolve_tesseract_variants(layout_mode: str) -> list[tuple[str, str]]:
     if layout_mode == OCR_LAYOUT_VERTICAL:
         return [
-            ("kor+chi_tra_vert+chi_tra", "5"),
+            ("kor+eng+chi_tra_vert+chi_tra", "5"),
+            ("kor+eng", "5"),
+            ("kor", "5"),
         ]
     if layout_mode == OCR_LAYOUT_HORIZONTAL:
         return [
-            ("kor+chi_tra", "6"),
+            ("kor+eng", "6"),
+            ("kor", "6"),
+            ("eng", "6"),
         ]
     return [
-        ("kor+chi_tra", "6"),
+        ("kor+eng", "6"),
+        ("kor", "6"),
+        ("eng", "6"),
+        ("kor+eng+chi_tra", "6"),
     ]
 
 
@@ -1395,25 +1412,27 @@ def _extract_page_raw_texts_with_ocr(
                 if not should_retry:
                     break
             try:
-                images = convert_from_path(
-                    str(input_pdf),
-                    first_page=first_page,
-                    last_page=last_page,
-                    dpi=dpi,
-                    size=OCR_MAX_IMAGE_SIZE,
-                    thread_count=pdf2image_thread_count,
-                    grayscale=OCR_PDF2IMAGE_USE_GRAYSCALE,
-                    use_pdftocairo=OCR_PDF2IMAGE_USE_PDFTOCAIRO,
-                    timeout=OCR_PDF2IMAGE_TIMEOUT_SECONDS,
-                )
+                convert_kwargs: dict[str, object] = {
+                    "first_page": first_page,
+                    "last_page": last_page,
+                    "dpi": dpi,
+                    "thread_count": pdf2image_thread_count,
+                    "grayscale": False if backend == "tesseract" else OCR_PDF2IMAGE_USE_GRAYSCALE,
+                    "use_pdftocairo": OCR_PDF2IMAGE_USE_PDFTOCAIRO,
+                    "timeout": OCR_PDF2IMAGE_TIMEOUT_SECONDS,
+                }
+                if backend != "tesseract":
+                    convert_kwargs["size"] = OCR_MAX_IMAGE_SIZE
+                images = convert_from_path(str(input_pdf), **convert_kwargs)
             except TypeError:
-                images = convert_from_path(
-                    str(input_pdf),
-                    first_page=first_page,
-                    last_page=last_page,
-                    dpi=dpi,
-                    size=OCR_MAX_IMAGE_SIZE,
-                )
+                fallback_kwargs: dict[str, object] = {
+                    "first_page": first_page,
+                    "last_page": last_page,
+                    "dpi": dpi,
+                }
+                if backend != "tesseract":
+                    fallback_kwargs["size"] = OCR_MAX_IMAGE_SIZE
+                images = convert_from_path(str(input_pdf), **fallback_kwargs)
 
             for image_offset in range(expected_count):
                 page_number = first_page + image_offset
