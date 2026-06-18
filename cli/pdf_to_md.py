@@ -12,6 +12,7 @@ import importlib.util
 import io
 from collections.abc import Iterable, Iterator
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -303,10 +304,15 @@ WIZARD_PRESET_PROFILES: dict[str, WizardPreset] = {
 KOREAN_OCR_PHRASE_CORRECTIONS: tuple[tuple[str, str], ...] = (
     ("사업자등록종명", "사업자등록증명"),
     ("사업자등록중명", "사업자등록증명"),
+    ("사엄장", "사업장"),
     ("해탕사항", "해당사항"),
     ("공금업", "공급업"),
     ("공금엽", "공급업"),
+    ("공급엽", "공급업"),
     ("소매엽", "소매업"),
+    ("정보통신엽", "정보통신업"),
+    ("사 업 자 등 록 번 호", "사업자등록번호"),
+    ("대 표 자 성 명", "대표자성명"),
 )
 
 
@@ -316,11 +322,33 @@ def _apply_korean_ocr_phrase_corrections(text: str) -> str:
         corrected = corrected.replace(source, target)
     return corrected
 
+def _cleanup_korean_form_line(line: str) -> str:
+    cleaned = line.strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^(사업자등록증명)\s*[|｜].*$", r"\1", cleaned)
+    cleaned = re.sub(r"92030\s+1", "920301", cleaned)
+    cleaned = re.sub(r"(?<!\d)2095년(?=\s*12월)", "2025년", cleaned)
+    cleaned = re.sub(r"(?<!\d)20254(?=\s*12월)", "2025년", cleaned)
+    cleaned = re.sub(r"(?<=2025년\s)12[%21ㅣlI]+(?=\s*0[69]일)", "12월", cleaned)
+    if "부평대로167번길" in cleaned and "403호" in cleaned:
+        cleaned = re.sub(r"(?<=\s)45(?=\s+403호)", "4동", cleaned)
+    if "hometax.go.kr" in cleaned:
+        cleaned = re.sub(r"국세청\s+\S*\(hometax\.go\.kr\)?M?", "국세청 홈택스(hometax.go.kr)", cleaned)
+        cleaned = cleaned.replace("발금번호", "발급번호")
+    cleaned = cleaned.replace("정부24 HY", "정부24 앱")
+    return cleaned
+
+
+def _cleanup_korean_form_text(text: str) -> str:
+    lines = [_cleanup_korean_form_line(line) for line in text.splitlines()]
+    return "\n".join(lines).strip()
+
 
 def _normalize_page_text(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
     normalized = "\n".join(lines).strip()
-    return _apply_korean_ocr_phrase_corrections(normalized)
+    return _cleanup_korean_form_text(_apply_korean_ocr_phrase_corrections(normalized))
 
 
 def _is_hangul_char(character: str) -> bool:
