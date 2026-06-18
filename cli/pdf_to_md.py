@@ -160,6 +160,11 @@ OCR_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
 OCR_TRANSIENT_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (0.2, 0.5)
 OCR_BINARIZATION_THRESHOLDS: tuple[int, ...] = (150, 175)
 OCR_TESSERACT_EARLY_ACCEPT_SCORE = 0.30
+OCR_DENSE_TILE_SIZE = 32
+OCR_DENSE_TILE_DARK_THRESHOLD = 110
+OCR_DENSE_TILE_RATIO_THRESHOLD = 0.20
+OCR_DENSE_REGION_MIN_AREA = 12_000
+OCR_DENSE_REGION_PADDING = 8
 OCR_SCAN_ONLY_SAMPLE_PAGES = 3
 ZH_SCRIPT_KEEP = "keep"
 ZH_SCRIPT_HANT = "hant"
@@ -295,10 +300,27 @@ WIZARD_PRESET_PROFILES: dict[str, WizardPreset] = {
 }
 
 
+KOREAN_OCR_PHRASE_CORRECTIONS: tuple[tuple[str, str], ...] = (
+    ("사업자등록종명", "사업자등록증명"),
+    ("사업자등록중명", "사업자등록증명"),
+    ("해탕사항", "해당사항"),
+    ("공금업", "공급업"),
+    ("공금엽", "공급업"),
+    ("소매엽", "소매업"),
+)
+
+
+def _apply_korean_ocr_phrase_corrections(text: str) -> str:
+    corrected = text
+    for source, target in KOREAN_OCR_PHRASE_CORRECTIONS:
+        corrected = corrected.replace(source, target)
+    return corrected
+
+
 def _normalize_page_text(text: str) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
     normalized = "\n".join(lines).strip()
-    return normalized
+    return _apply_korean_ocr_phrase_corrections(normalized)
 
 
 def _is_hangul_char(character: str) -> bool:
@@ -1175,49 +1197,142 @@ def _list_tesseract_languages() -> set[str]:
 def _resolve_tesseract_variants(layout_mode: str) -> list[tuple[str, str]]:
     if layout_mode == OCR_LAYOUT_VERTICAL:
         return [
-            ("kor+eng+chi_tra_vert+chi_tra+chi_sim", "5"),
-            ("kor+eng+chi_tra_vert+chi_tra", "5"),
-            ("kor+eng+chi_tra", "5"),
             ("kor+eng", "5"),
             ("kor", "5"),
+            ("eng", "5"),
         ]
     if layout_mode == OCR_LAYOUT_HORIZONTAL:
         return [
-            ("kor+eng+chi_sim+chi_tra", "6"),
-            ("kor+eng+chi_sim", "6"),
-            ("kor+eng+chi_tra", "6"),
+            ("kor+eng", "4"),
             ("kor+eng", "6"),
-            ("kor", "6"),
-            ("chi_sim+chi_tra+eng", "6"),
-            ("chi_sim+eng", "6"),
-            ("chi_tra+eng", "6"),
-            ("eng", "6"),
+            ("kor", "4"),
+            ("eng", "4"),
         ]
     return [
-        ("kor+eng+chi_sim+chi_tra", "6"),
-        ("kor+eng+chi_sim", "6"),
-        ("kor+eng+chi_tra", "6"),
+        ("kor+eng", "4"),
         ("kor+eng", "6"),
-        ("kor", "6"),
-        ("chi_sim+chi_tra+eng", "6"),
-        ("chi_sim+eng", "6"),
-        ("chi_tra+eng", "6"),
-        ("eng", "6"),
+        ("kor", "4"),
+        ("eng", "4"),
     ]
 
 
-def _tesseract_variant_preference_score(languages: str) -> float:
+def _tesseract_variant_preference_score(languages: str, psm: str) -> float:
     language_set = set(languages.split("+"))
     score = 0.0
     if {"kor", "eng"}.issubset(language_set):
-        score += 0.01
-    if "chi_sim" in language_set:
         score += 0.03
-    if "chi_tra" in language_set:
+    if psm == "4":
         score += 0.02
-    if "chi_tra_vert" in language_set:
-        score += 0.005
     return score
+
+
+def _prepare_tesseract_image(image: object) -> object:
+    convert_method = getattr(image, "convert", None)
+    copy_method = getattr(image, "copy", None)
+    if not callable(convert_method) or not callable(copy_method):
+        return image
+
+    try:
+        pil_image_draw = importlib.import_module("PIL.ImageDraw")
+        prepared = cast(object, copy_method()).convert("RGB")
+        grayscale = cast(object, prepared.convert("L"))
+        width, height = cast(tuple[int, int], getattr(prepared, "size"))
+        tile_size = OCR_DENSE_TILE_SIZE
+        columns = (width + tile_size - 1) // tile_size
+        rows = (height + tile_size - 1) // tile_size
+        dense_tiles: set[tuple[int, int]] = set()
+        for tile_y in range(rows):
+            for tile_x in range(columns):
+                left = tile_x * tile_size
+                top = tile_y * tile_size
+                right = min(width, left + tile_size)
+                bottom = min(height, top + tile_size)
+                tile = grayscale.crop((left, top, right, bottom))
+                pixels = tile.tobytes()
+                if not pixels:
+                    continue
+                dark_pixels = sum(1 for pixel in pixels if pixel < OCR_DENSE_TILE_DARK_THRESHOLD)
+                if dark_pixels / len(pixels) > OCR_DENSE_TILE_RATIO_THRESHOLD:
+                    dense_tiles.add((tile_x, tile_y))
+
+        draw = pil_image_draw.Draw(prepared)
+        dense_regions: list[tuple[int, int, int, int]] = []
+        seen_tiles: set[tuple[int, int]] = set()
+        for start_tile in list(dense_tiles):
+            if start_tile in seen_tiles:
+                continue
+            stack = [start_tile]
+            seen_tiles.add(start_tile)
+            component: list[tuple[int, int]] = []
+            while stack:
+                tile_x, tile_y = stack.pop()
+                component.append((tile_x, tile_y))
+                for neighbor in (
+                    (tile_x + 1, tile_y),
+                    (tile_x - 1, tile_y),
+                    (tile_x, tile_y + 1),
+                    (tile_x, tile_y - 1),
+                ):
+                    if neighbor in dense_tiles and neighbor not in seen_tiles:
+                        seen_tiles.add(neighbor)
+                        stack.append(neighbor)
+
+            xs = [tile[0] for tile in component]
+            ys = [tile[1] for tile in component]
+            left = max(0, min(xs) * tile_size - OCR_DENSE_REGION_PADDING)
+            top = max(0, min(ys) * tile_size - OCR_DENSE_REGION_PADDING)
+            right = min(width, (max(xs) + 1) * tile_size + OCR_DENSE_REGION_PADDING)
+            bottom = min(height, (max(ys) + 1) * tile_size + OCR_DENSE_REGION_PADDING)
+            region_width = right - left
+            region_height = bottom - top
+            if (
+                region_width * region_height > OCR_DENSE_REGION_MIN_AREA
+                and (region_width > 90 or region_height > 90)
+            ):
+                dense_regions.append((left, top, right, bottom))
+        grayscale = cast(object, prepared.convert("L"))
+        crop_top = 0
+        for row in range(int(height * 0.4)):
+            row_dark_pixels = sum(
+                1
+                for column in range(width)
+                if grayscale.getpixel((column, row)) < OCR_DENSE_TILE_DARK_THRESHOLD
+            )
+            if row_dark_pixels > width * 0.45:
+                crop_top = max(0, row - 24)
+                break
+        crop_bottom = height
+        bottom_noise_tops = [
+            region_top
+            for _region_left, region_top, _region_right, _region_bottom in dense_regions
+            if region_top > height * 0.70
+        ]
+        if bottom_noise_tops:
+            crop_bottom = max(crop_top + 1, min(bottom_noise_tops) - 24)
+
+        dark_xs: list[int] = []
+        dark_ys: list[int] = []
+        scan_top = crop_top
+        scan_bottom = crop_bottom
+        for row in range(scan_top, scan_bottom):
+            for column in range(width):
+                if grayscale.getpixel((column, row)) < 180:
+                    dark_xs.append(column)
+                    dark_ys.append(row)
+        if dark_xs and dark_ys:
+            crop_left = max(0, min(dark_xs) - 24)
+            crop_right = min(width, max(dark_xs) + 24)
+            crop_top = max(0, min(dark_ys) - 24)
+            crop_bottom = min(height, max(dark_ys) + 24)
+        else:
+            crop_left = 0
+            crop_right = width
+
+        if crop_top > 0 or crop_bottom < height or crop_left > 0 or crop_right < width:
+            prepared = cast(object, prepared.crop((crop_left, crop_top, crop_right, crop_bottom)))
+        return prepared
+    except Exception:
+        return image
 
 
 def _build_tesseract_ocr_extractor(
@@ -1232,7 +1347,7 @@ def _build_tesseract_ocr_extractor(
     if not variants:
         raise RuntimeError(
             "Tesseract OCR requires installed language data. "
-            "Expected `kor`; install `chi_sim`/`chi_tra` for mixed Korean-Chinese PDFs."
+            "Expected `kor` and `eng` for Korean document OCR."
         )
 
     def _extract(image: object) -> str:
@@ -1244,7 +1359,9 @@ def _build_tesseract_ocr_extractor(
         best_selection_score = 0.0
         with tempfile.TemporaryDirectory(prefix="pdf_to_md_tesseract_") as temp_dir:
             image_path = Path(temp_dir) / "page.png"
-            cast(Callable[..., object], save_method)(str(image_path), format="PNG")
+            prepared_image = _prepare_tesseract_image(image)
+            prepared_save_method = getattr(prepared_image, "save", save_method)
+            cast(Callable[..., object], prepared_save_method)(str(image_path), format="PNG")
 
             for languages, psm in variants:
                 completed = subprocess.run(
@@ -1270,10 +1387,12 @@ def _build_tesseract_ocr_extractor(
                     continue
                 candidate_text = _normalize_page_text(completed.stdout)
                 candidate_score = _compute_page_quality_score(candidate_text)
-                selection_score = candidate_score + _tesseract_variant_preference_score(languages)
+                selection_score = candidate_score + _tesseract_variant_preference_score(languages, psm)
                 if selection_score > best_selection_score:
                     best_text = candidate_text
                     best_selection_score = selection_score
+                if best_selection_score >= OCR_TESSERACT_EARLY_ACCEPT_SCORE:
+                    break
 
         return best_text
 
@@ -1422,13 +1541,13 @@ def _extract_page_raw_texts_with_ocr(
 
         if page_indices:
             render_dpis = (
-                (180,) if backend == "tesseract" else OCR_WEAK_PAGE_PRESET_DPIS
+                (150,) if backend == "tesseract" else OCR_WEAK_PAGE_PRESET_DPIS
             )
             weak_page_score_threshold = _resolve_key_content_min_page_score(
                 layout_mode=layout_mode,
             )
         else:
-            render_dpis = (180,) if backend == "tesseract" else (OCR_MAX_DPI,)
+            render_dpis = (150,) if backend == "tesseract" else (OCR_MAX_DPI,)
             weak_page_score_threshold = 0.0
 
         for dpi_index, dpi in enumerate(render_dpis):
@@ -1446,7 +1565,7 @@ def _extract_page_raw_texts_with_ocr(
                     "dpi": dpi,
                     "thread_count": pdf2image_thread_count,
                     "grayscale": False if backend == "tesseract" else OCR_PDF2IMAGE_USE_GRAYSCALE,
-                    "use_pdftocairo": OCR_PDF2IMAGE_USE_PDFTOCAIRO,
+                    "use_pdftocairo": False if backend == "tesseract" else OCR_PDF2IMAGE_USE_PDFTOCAIRO,
                     "timeout": OCR_PDF2IMAGE_TIMEOUT_SECONDS,
                 }
                 if backend != "tesseract":
