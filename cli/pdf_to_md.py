@@ -166,6 +166,16 @@ OCR_PROFILE_CHOICES: tuple[str, ...] = (
     OCR_PROFILE_BOOK_SCAN,
     OCR_PROFILE_TABLE_HEAVY,
 )
+OCR_ACCURACY_FAST = "fast"
+OCR_ACCURACY_BALANCED = "balanced"
+OCR_ACCURACY_ACCURATE = "accurate"
+OCR_ACCURACY_MAX = "max"
+OCR_ACCURACY_CHOICES: tuple[str, ...] = (
+    OCR_ACCURACY_FAST,
+    OCR_ACCURACY_BALANCED,
+    OCR_ACCURACY_ACCURATE,
+    OCR_ACCURACY_MAX,
+)
 OCR_PDF2IMAGE_TIMEOUT_SECONDS = 120
 OCR_PDF2IMAGE_THREAD_COUNT_SINGLE_WORKER_CAP = 4
 OCR_PDF2IMAGE_USE_GRAYSCALE = True
@@ -190,6 +200,7 @@ ZH_SCRIPT_CHOICES: tuple[str, ...] = (
     ZH_SCRIPT_HANS,
 )
 _active_ocr_profile = OCR_PROFILE_NONE
+_active_ocr_accuracy = OCR_ACCURACY_BALANCED
 
 _OPENCC_CONFIG_BY_ZH_SCRIPT: dict[str, str] = {
     ZH_SCRIPT_HANT: "s2t",
@@ -333,6 +344,7 @@ class TesseractOcrCandidate:
     blocks: tuple[OcrBlock, ...]
     mean_confidence: float
     low_confidence_lines: int
+    low_confidence_preview: tuple[str, ...]
     score: float
 
 
@@ -1431,13 +1443,22 @@ def _render_tesseract_blocks(blocks: tuple[OcrBlock, ...]) -> str:
     return "\n".join(_clean_ocr_lines(lines))
 
 
-def _score_tesseract_blocks(blocks: tuple[OcrBlock, ...], text: str) -> tuple[float, int]:
+def _score_tesseract_blocks(blocks: tuple[OcrBlock, ...], text: str) -> tuple[float, int, tuple[str, ...]]:
     lines = [line for block in blocks for line in block.lines]
     if not lines:
-        return 0.0, 0
+        return 0.0, 0, ()
     mean_confidence = sum(line.confidence for line in lines) / len(lines)
     low_confidence_lines = sum(1 for line in lines if line.confidence < OCR_TESSERACT_MIN_LINE_CONFIDENCE)
-    return mean_confidence, low_confidence_lines
+    return mean_confidence, low_confidence_lines, _extract_low_confidence_preview(lines)
+
+def _extract_low_confidence_preview(lines: list[OcrLine], *, limit: int = 3) -> tuple[str, ...]:
+    low_lines = [
+        line.text.strip()
+        for line in sorted(lines, key=lambda line: line.confidence)
+        if line.confidence < OCR_TESSERACT_MIN_LINE_CONFIDENCE and line.text.strip()
+    ]
+    return tuple(low_lines[:limit])
+
 
 
 def _run_tesseract_candidate(image_path: Path, languages: str, psm: str) -> TesseractOcrCandidate | None:
@@ -1467,7 +1488,7 @@ def _run_tesseract_candidate(image_path: Path, languages: str, psm: str) -> Tess
     text = _normalize_page_text(_render_tesseract_blocks(blocks))
     if not text:
         return None
-    mean_confidence, low_confidence_lines = _score_tesseract_blocks(blocks, text)
+    mean_confidence, low_confidence_lines, low_confidence_preview = _score_tesseract_blocks(blocks, text)
     score = _compute_page_quality_score(text) + (mean_confidence / 100.0) * 0.12
     score += _tesseract_variant_preference_score(languages, psm)
     return TesseractOcrCandidate(
@@ -1477,6 +1498,7 @@ def _run_tesseract_candidate(image_path: Path, languages: str, psm: str) -> Tess
         blocks=blocks,
         mean_confidence=mean_confidence,
         low_confidence_lines=low_confidence_lines,
+        low_confidence_preview=low_confidence_preview,
         score=score,
     )
 
@@ -1628,11 +1650,16 @@ def _build_tesseract_ocr_extractor(
 
         if best_candidate is None:
             return ""
+        preview = " | ".join(
+            snippet.replace("\n", " ").replace("|", "/")
+            for snippet in best_candidate.low_confidence_preview
+        )
         _write_stderr_line(
             "Diagnostics: mode=tesseract_candidate "
             f"selected=true language={best_candidate.language} psm={best_candidate.psm} "
             f"mean_confidence={best_candidate.mean_confidence:.1f} "
             f"low_confidence_lines={best_candidate.low_confidence_lines} "
+            f"low_confidence_preview={preview or 'none'} "
             f"score={best_candidate.score:.3f}"
         )
         return best_candidate.text
@@ -1689,7 +1716,6 @@ def _build_weak_page_image_variants(
                         ),
                     )
                 )
-
     deduped_variants: list[object] = []
     seen_variant_ids: set[int] = set()
     for variant in variants:
@@ -1699,6 +1725,18 @@ def _build_weak_page_image_variants(
         seen_variant_ids.add(variant_id)
         deduped_variants.append(variant)
     return deduped_variants
+
+
+def _resolve_tesseract_render_dpis(*, page_indices: list[int] | None) -> tuple[int, ...]:
+    if _active_ocr_accuracy == OCR_ACCURACY_FAST:
+        return (150,)
+    if _active_ocr_accuracy == OCR_ACCURACY_BALANCED:
+        return (150, 180) if page_indices else (150,)
+    if _active_ocr_accuracy == OCR_ACCURACY_ACCURATE:
+        return (150, 180, 220) if page_indices else (180, 150)
+    if _active_ocr_accuracy == OCR_ACCURACY_MAX:
+        return (150, 180, 220, 300) if page_indices else (180, 220, 150)
+    return (150,)
 
 
 def _extract_page_raw_texts_with_ocr(
@@ -1763,6 +1801,30 @@ def _extract_page_raw_texts_with_ocr(
     if image_to_string is None:
         raise RuntimeError("OCR extractor initialization failed")
     resolved_image_to_string = image_to_string
+
+    if page_indices:
+        render_dpis = (
+            _resolve_tesseract_render_dpis(page_indices=page_indices)
+            if backend == "tesseract"
+            else OCR_WEAK_PAGE_PRESET_DPIS
+        )
+        weak_page_score_threshold = _resolve_key_content_min_page_score(
+            layout_mode=layout_mode,
+        )
+    else:
+        render_dpis = (
+            _resolve_tesseract_render_dpis(page_indices=None)
+            if backend == "tesseract"
+            else (OCR_MAX_DPI,)
+        )
+        weak_page_score_threshold = 0.0
+    if backend == "tesseract":
+        _write_stderr_line(
+            "Diagnostics: mode=ocr_renderer "
+            f"backend={backend} renderer=pdftoppm "
+            f"dpi_candidates={','.join(str(dpi) for dpi in render_dpis)} "
+            f"accuracy={_active_ocr_accuracy}"
+        )
 
     page_text_by_number: dict[int, str] = {}
     progress_total = (
@@ -2443,6 +2505,7 @@ def _run_split_before_ocr_conversion(
     ocr_classical_zh_postprocess: bool,
     ocr_key_content_fallback: bool,
     ocr_profile: str = OCR_PROFILE_NONE,
+    ocr_accuracy: str = OCR_ACCURACY_BALANCED,
     zh_script: str = ZH_SCRIPT_KEEP,
     split_ocr_parallel: bool = False,
     workers: int | None = None,
@@ -2504,6 +2567,7 @@ def _run_split_before_ocr_conversion(
                     "ocr_key_content_fallback_arg": ocr_key_content_fallback,
                     "zh_script_arg": zh_script,
                     "ocr_profile_arg": ocr_profile,
+                    "ocr_accuracy_arg": ocr_accuracy,
                     "max_pages_arg": None,
                     "split_preset_arg": None,
                     "split_every_arg": None,
@@ -3114,6 +3178,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Resource guard timeout behavior: fail-open continues, fail-closed aborts.",
     )
     _ = parser.add_argument(
+        "--ocr-accuracy",
+        default=OCR_ACCURACY_BALANCED,
+        choices=OCR_ACCURACY_CHOICES,
+        help="OCR candidate budget: fast, balanced, accurate, or max.",
+    )
+    _ = parser.add_argument(
         "--resource-guard-timeout-seconds",
         type=_positive_float,
         default=_RESOURCE_WAIT_MAX_SECONDS,
@@ -3462,9 +3532,10 @@ def _execute_conversion(
     resource_guard_timeout_seconds_arg: float,
     resource_guard_policy_arg: str,
     resolved_ocr_mode: str,
+    ocr_accuracy_arg: str,
     progress_format_arg: str = PROGRESS_FORMAT_TEXT,
 ) -> int:
-    global _active_progress_format, _active_ocr_profile
+    global _active_progress_format, _active_ocr_profile, _active_ocr_accuracy
 
     ocr_auto_mode_enabled = ocr_mode_arg == OCR_MODE_AUTO
     ocr_fallback_enabled = ocr_fallback_arg or ocr_auto_mode_enabled
@@ -3493,6 +3564,12 @@ def _execute_conversion(
         return 1
 
     estimated_page_count = _extract_page_count(input_pdf)
+    if ocr_accuracy_arg not in OCR_ACCURACY_CHOICES:
+        raise RuntimeError(
+            f"Invalid OCR accuracy `{ocr_accuracy_arg}`. "
+            f"Choose one of: {', '.join(OCR_ACCURACY_CHOICES)}"
+        )
+
     if max_pages_arg is not None:
         estimated_page_count = min(estimated_page_count, max(1, max_pages_arg))
     configured_fail_open = resource_guard_policy_arg == _RESOURCE_GUARD_POLICY_FAIL_OPEN
@@ -3521,6 +3598,8 @@ def _execute_conversion(
     _active_progress_format = progress_format_arg
     previous_ocr_profile = _active_ocr_profile
     _active_ocr_profile = ocr_profile_arg
+    previous_ocr_accuracy = _active_ocr_accuracy
+    _active_ocr_accuracy = ocr_accuracy_arg
     conversion_started_at = time.monotonic()
     stage_seconds: dict[str, float] = {
         "native": 0.0,
@@ -3531,11 +3610,10 @@ def _execute_conversion(
 
     def _format_stage_seconds(value: float) -> str:
         return f"{max(0.0, value):.3f}"
-
     try:
         native_page_progress_writer = _build_page_progress_writer(
             stage_label="native page progress",
-            range_start=15,
+            range_start=5,
             range_end=35,
         )
         _write_progress(0, "starting conversion")
@@ -3565,6 +3643,7 @@ def _execute_conversion(
                 ocr_key_content_fallback=ocr_key_content_fallback_arg,
                 zh_script=zh_script_arg,
                 ocr_profile=ocr_profile_arg,
+                ocr_accuracy=ocr_accuracy_arg,
                 split_ocr_parallel=split_ocr_parallel_arg,
                 workers=workers_arg,
                 resource_guard_timeout_seconds=resource_guard_timeout_seconds_arg,
@@ -3776,7 +3855,7 @@ def _execute_conversion(
     finally:
         _active_progress_format = previous_progress_format
         _active_ocr_profile = previous_ocr_profile
-
+        _active_ocr_accuracy = previous_ocr_accuracy
     return 0
 
 
@@ -3790,7 +3869,7 @@ def main(argv: list[str] | None = None) -> int:
     force_arg = getattr(args, "force", False)
     wizard_arg = getattr(args, "wizard", False)
     ctl_arg = getattr(args, "ctl", False)
-    ocr_fallback_arg = getattr(args, "ocr_fallback", False)
+    ocr_fallback_arg = bool(getattr(args, "ocr_fallback", False))
     ocr_mode_arg = getattr(args, "ocr", None)
     ocr_engine_arg = getattr(args, "ocr_engine", OCR_DEFAULT_ENGINE)
     ocr_layout_arg = getattr(args, "ocr_layout", OCR_LAYOUT_AUTO)
@@ -3804,6 +3883,7 @@ def main(argv: list[str] | None = None) -> int:
     ocr_profile_arg = getattr(args, "ocr_profile", OCR_PROFILE_NONE)
     max_pages_arg = getattr(args, "max_pages", None)
     workers_arg = getattr(args, "workers", None)
+    ocr_accuracy_arg = getattr(args, "ocr_accuracy", OCR_ACCURACY_BALANCED)
     resource_guard_policy_arg = getattr(
         args,
         "resource_guard_policy",
@@ -3879,6 +3959,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if resource_guard_policy_arg not in _RESOURCE_GUARD_POLICY_CHOICES:
         _write_stderr_line("Invalid resource guard policy argument.")
+        return 1
+    if not isinstance(ocr_accuracy_arg, str) or ocr_accuracy_arg not in OCR_ACCURACY_CHOICES:
+        _write_stderr_line("Invalid OCR accuracy argument.")
         return 1
     if not isinstance(ocr_profile_arg, str) or ocr_profile_arg not in OCR_PROFILE_CHOICES:
         _write_stderr_line("Invalid OCR profile argument.")
@@ -3967,6 +4050,7 @@ def main(argv: list[str] | None = None) -> int:
         ocr_fallback_arg=ocr_fallback_arg,
         ocr_mode_arg=ocr_mode_arg,
         ocr_engine_arg=ocr_engine_arg,
+        ocr_accuracy_arg=ocr_accuracy_arg,
         ocr_layout_arg=ocr_layout_arg,
         ocr_classical_zh_postprocess_arg=ocr_classical_zh_postprocess_arg,
         ocr_key_content_fallback_arg=ocr_key_content_fallback_arg,
