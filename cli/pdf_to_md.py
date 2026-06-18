@@ -392,6 +392,7 @@ def _apply_spaced_korean_form_corrections(text: str) -> str:
     spaced_patterns: tuple[tuple[str, str], ...] = (
         (r"사\s*업\s*자\s*등\s*록\s*[종중증]\s*명", "사업자등록증명"),
         (r"사\s*업\s*자\s*등\s*록\s*번\s*호", "사업자등록번호"),
+        (r"사\s*업\s*자\s*등\s*록\s*일", "사업자등록일"),
         (r"대\s*표\s*자\s*성\s*명", "대표자성명"),
         (r"사\s*업\s*장\s*소\s*재\s*지", "사업장소재지"),
         (r"정\s*보\s*통\s*신\s*업", "정보통신업"),
@@ -401,13 +402,20 @@ def _apply_spaced_korean_form_corrections(text: str) -> str:
         (r"부\s*평\s*대\s*로\s*167\s*번\s*길", "부평대로167번길"),
         (r"프\s*로\s*그\s*래\s*밍", "프로그래밍"),
         (r"해\s*[탕당]\s*사\s*항", "해당사항"),
+        (r"해탕사항", "해당사항"),
         (r"증\s*명\s*합니다", "증명합니다"),
         (r"폰\s*스\s*링\s*크", "폰스링크"),
         (r"홈\s*택\s*스", "홈택스"),
         (r"문\s*서\s*발\s*급\s*번\s*호", "문서발급번호"),
+        (r"개\s*업\s*일", "개업일"),
+        (r"수\s*번", "수번"),
+        (r"당\s*부\s*서", "당부서"),
+        (r"민\s*원\s*봉\s*사\s*실", "민원봉사실"),
     )
     for pattern, target in spaced_patterns:
         corrected = re.sub(pattern, target, corrected)
+    corrected = re.sub(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", r"\1년\2월\3일", corrected)
+    corrected = re.sub(r"(\d{4})년(\d{1,2})월(\d{1,2})일", r"\1년 \2월 \3일", corrected)
     return corrected
 
 
@@ -1366,6 +1374,58 @@ def _merge_word_bbox(words: tuple[OcrWord, ...]) -> tuple[int, int, int, int]:
     )
 
 
+CJK_MERGE_MAX_GAP_RATIO = 0.9
+LAYOUT_COLUMN_GAP_RATIO = 0.4
+LAYOUT_PARAGRAPH_GAP_RATIO = 1.8
+LAYOUT_SECTION_GAP_RATIO = 3.0
+
+
+def _is_all_cjk_or_digit(text: str) -> bool:
+    return all(
+        _is_cjk_or_hangul_char(character) or character.isdigit()
+        for character in text
+    )
+
+
+def _merge_cjk_line_words(words: tuple[OcrWord, ...]) -> tuple[OcrWord, ...]:
+    if len(words) <= 1:
+        return words
+    merged: list[OcrWord] = []
+    current = words[0]
+    for next_word in words[1:]:
+        current_right = current.bbox[2]
+        next_left = next_word.bbox[0]
+        current_width = current.bbox[2] - current.bbox[0]
+        next_width = next_word.bbox[2] - next_word.bbox[0]
+        avg_width = max(1, (current_width + next_width) / 2)
+        gap = next_left - current_right
+        should_merge = (
+            _is_all_cjk_or_digit(current.text)
+            and _is_all_cjk_or_digit(next_word.text)
+            and gap >= 0
+            and gap < avg_width * CJK_MERGE_MAX_GAP_RATIO
+        )
+        if should_merge:
+            current = OcrWord(
+                text=current.text + next_word.text,
+                confidence=min(current.confidence, next_word.confidence),
+                bbox=(
+                    min(current.bbox[0], next_word.bbox[0]),
+                    min(current.bbox[1], next_word.bbox[1]),
+                    max(current.bbox[2], next_word.bbox[2]),
+                    max(current.bbox[3], next_word.bbox[3]),
+                ),
+                block_no=current.block_no,
+                line_no=current.line_no,
+                word_no=current.word_no,
+            )
+        else:
+            merged.append(current)
+            current = next_word
+    merged.append(current)
+    return tuple(merged)
+
+
 def _parse_tesseract_tsv(tsv_text: str) -> tuple[OcrBlock, ...]:
     rows = [line.split("\t") for line in tsv_text.splitlines() if line.strip()]
     if not rows:
@@ -1412,11 +1472,12 @@ def _parse_tesseract_tsv(tsv_text: str) -> tuple[OcrBlock, ...]:
         ordered_words = tuple(sorted(words_for_line, key=lambda word: (word.bbox[0], word.word_no)))
         if not ordered_words:
             continue
+        merged_words = _merge_cjk_line_words(ordered_words)
         line = OcrLine(
-            text=" ".join(word.text for word in ordered_words),
-            confidence=sum(word.confidence for word in ordered_words) / len(ordered_words),
-            bbox=_merge_word_bbox(ordered_words),
-            words=ordered_words,
+            text=" ".join(word.text for word in merged_words),
+            confidence=sum(word.confidence for word in merged_words) / len(merged_words),
+            bbox=_merge_word_bbox(merged_words),
+            words=merged_words,
         )
         block_lines.setdefault(block_no, []).append(line)
 
@@ -1439,8 +1500,84 @@ def _parse_tesseract_tsv(tsv_text: str) -> tuple[OcrBlock, ...]:
 
 
 def _render_tesseract_blocks(blocks: tuple[OcrBlock, ...]) -> str:
-    lines = [line.text for block in blocks for line in block.lines if line.text.strip()]
-    return "\n".join(_clean_ocr_lines(lines))
+    return _render_tesseract_blocks_layout(blocks)
+
+
+def _render_tesseract_blocks_layout(blocks: tuple[OcrBlock, ...], *, page_width: int = 1240) -> str:
+    all_lines: list[OcrLine] = [
+        line for block in blocks for line in block.lines if line.text.strip()
+    ]
+    if not all_lines:
+        return ""
+
+    all_line_heights: list[int] = []
+    for line in all_lines:
+        height = line.bbox[3] - line.bbox[1]
+        if height > 0:
+            all_line_heights.append(height)
+    median_line_height = sorted(all_line_heights)[len(all_line_heights) // 2] if all_line_heights else 20
+
+    all_word_widths: list[int] = []
+    for line in all_lines:
+        for word in line.words:
+            width = word.bbox[2] - word.bbox[0]
+            if width > 0:
+                all_word_widths.append(width)
+    median_word_width = sorted(all_word_widths)[len(all_word_widths) // 2] if all_word_widths else 15
+
+    def _render_line_with_layout(line: OcrLine) -> str:
+        if not line.words:
+            return line.text
+        segments: list[str] = []
+        prev_right = line.words[0].bbox[0]
+        prev_is_cjk = _is_all_cjk_or_digit(line.words[0].text)
+        for idx, word in enumerate(line.words):
+            gap = word.bbox[0] - prev_right
+            current_is_cjk = _is_all_cjk_or_digit(word.text)
+            if idx > 0:
+                if prev_is_cjk and current_is_cjk:
+                    if gap > median_word_width * LAYOUT_SECTION_GAP_RATIO:
+                        segments.append("    ")
+                    elif gap > median_word_width * LAYOUT_COLUMN_GAP_RATIO:
+                        segments.append(" ")
+                elif prev_is_cjk != current_is_cjk:
+                    segments.append(" ")
+                elif gap > median_word_width * LAYOUT_COLUMN_GAP_RATIO:
+                    spaces = max(1, int(gap / median_word_width))
+                    segments.append(" " * min(spaces, 12))
+                else:
+                    segments.append(" ")
+            segments.append(word.text)
+            prev_right = word.bbox[2]
+            prev_is_cjk = current_is_cjk
+        return "".join(segments)
+
+    output_lines: list[str] = []
+    prev_line_bottom = 0
+    for line in all_lines:
+        if prev_line_bottom > 0:
+            gap = line.bbox[1] - prev_line_bottom
+            if gap >= median_line_height * LAYOUT_SECTION_GAP_RATIO:
+                if output_lines and output_lines[-1] != "":
+                    output_lines.append("")
+                if len(output_lines) >= 2 and output_lines[-2] != "":
+                    output_lines.insert(-1, "")
+            elif gap >= median_line_height * LAYOUT_PARAGRAPH_GAP_RATIO:
+                if output_lines and output_lines[-1] != "":
+                    output_lines.append("")
+        rendered = _render_line_with_layout(line)
+        if rendered.strip():
+            output_lines.append(rendered)
+        prev_line_bottom = line.bbox[3]
+
+    cleaned: list[str] = []
+    for output_line in output_lines:
+        cleaned_line = output_line.rstrip()
+        if cleaned_line or (cleaned and cleaned[-1] != ""):
+            cleaned.append(cleaned_line)
+    while cleaned and cleaned[-1] == "":
+        cleaned.pop()
+    return "\n".join(cleaned)
 
 
 def _score_tesseract_blocks(blocks: tuple[OcrBlock, ...], text: str) -> tuple[float, int, tuple[str, ...]]:
