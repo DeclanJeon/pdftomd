@@ -1175,22 +1175,49 @@ def _list_tesseract_languages() -> set[str]:
 def _resolve_tesseract_variants(layout_mode: str) -> list[tuple[str, str]]:
     if layout_mode == OCR_LAYOUT_VERTICAL:
         return [
+            ("kor+eng+chi_tra_vert+chi_tra+chi_sim", "5"),
             ("kor+eng+chi_tra_vert+chi_tra", "5"),
+            ("kor+eng+chi_tra", "5"),
             ("kor+eng", "5"),
             ("kor", "5"),
         ]
     if layout_mode == OCR_LAYOUT_HORIZONTAL:
         return [
+            ("kor+eng+chi_sim+chi_tra", "6"),
+            ("kor+eng+chi_sim", "6"),
+            ("kor+eng+chi_tra", "6"),
             ("kor+eng", "6"),
             ("kor", "6"),
+            ("chi_sim+chi_tra+eng", "6"),
+            ("chi_sim+eng", "6"),
+            ("chi_tra+eng", "6"),
             ("eng", "6"),
         ]
     return [
+        ("kor+eng+chi_sim+chi_tra", "6"),
+        ("kor+eng+chi_sim", "6"),
+        ("kor+eng+chi_tra", "6"),
         ("kor+eng", "6"),
         ("kor", "6"),
+        ("chi_sim+chi_tra+eng", "6"),
+        ("chi_sim+eng", "6"),
+        ("chi_tra+eng", "6"),
         ("eng", "6"),
-        ("kor+eng+chi_tra", "6"),
     ]
+
+
+def _tesseract_variant_preference_score(languages: str) -> float:
+    language_set = set(languages.split("+"))
+    score = 0.0
+    if {"kor", "eng"}.issubset(language_set):
+        score += 0.01
+    if "chi_sim" in language_set:
+        score += 0.03
+    if "chi_tra" in language_set:
+        score += 0.02
+    if "chi_tra_vert" in language_set:
+        score += 0.005
+    return score
 
 
 def _build_tesseract_ocr_extractor(
@@ -1205,7 +1232,7 @@ def _build_tesseract_ocr_extractor(
     if not variants:
         raise RuntimeError(
             "Tesseract OCR requires installed language data. "
-            "Expected at least `kor` and optionally `chi_tra`/`chi_tra_vert`."
+            "Expected `kor`; install `chi_sim`/`chi_tra` for mixed Korean-Chinese PDFs."
         )
 
     def _extract(image: object) -> str:
@@ -1214,7 +1241,7 @@ def _build_tesseract_ocr_extractor(
             return ""
 
         best_text = ""
-        best_score = 0.0
+        best_selection_score = 0.0
         with tempfile.TemporaryDirectory(prefix="pdf_to_md_tesseract_") as temp_dir:
             image_path = Path(temp_dir) / "page.png"
             cast(Callable[..., object], save_method)(str(image_path), format="PNG")
@@ -1243,9 +1270,10 @@ def _build_tesseract_ocr_extractor(
                     continue
                 candidate_text = _normalize_page_text(completed.stdout)
                 candidate_score = _compute_page_quality_score(candidate_text)
-                if candidate_score > best_score:
+                selection_score = candidate_score + _tesseract_variant_preference_score(languages)
+                if selection_score > best_selection_score:
                     best_text = candidate_text
-                    best_score = candidate_score
+                    best_selection_score = selection_score
 
         return best_text
 
