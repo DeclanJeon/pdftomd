@@ -152,6 +152,20 @@ OCR_MODE_AUTO = "auto"
 OCR_LAYOUT_AUTO = "auto"
 OCR_LAYOUT_VERTICAL = "vertical"
 OCR_LAYOUT_HORIZONTAL = "horizontal"
+OCR_PROFILE_NONE = "none"
+OCR_PROFILE_KOREAN_PUBLIC_DOCUMENT = "korean-public-document"
+OCR_PROFILE_RECEIPT = "receipt"
+OCR_PROFILE_CONTRACT = "contract"
+OCR_PROFILE_BOOK_SCAN = "book-scan"
+OCR_PROFILE_TABLE_HEAVY = "table-heavy"
+OCR_PROFILE_CHOICES: tuple[str, ...] = (
+    OCR_PROFILE_NONE,
+    OCR_PROFILE_KOREAN_PUBLIC_DOCUMENT,
+    OCR_PROFILE_RECEIPT,
+    OCR_PROFILE_CONTRACT,
+    OCR_PROFILE_BOOK_SCAN,
+    OCR_PROFILE_TABLE_HEAVY,
+)
 OCR_PDF2IMAGE_TIMEOUT_SECONDS = 120
 OCR_PDF2IMAGE_THREAD_COUNT_SINGLE_WORKER_CAP = 4
 OCR_PDF2IMAGE_USE_GRAYSCALE = True
@@ -175,6 +189,8 @@ ZH_SCRIPT_CHOICES: tuple[str, ...] = (
     ZH_SCRIPT_HANT,
     ZH_SCRIPT_HANS,
 )
+_active_ocr_profile = OCR_PROFILE_NONE
+
 _OPENCC_CONFIG_BY_ZH_SCRIPT: dict[str, str] = {
     ZH_SCRIPT_HANT: "s2t",
     ZH_SCRIPT_HANS: "t2s",
@@ -284,6 +300,43 @@ class WizardPreset:
 
 
 @dataclass(frozen=True)
+class OcrWord:
+    text: str
+    confidence: float
+    bbox: tuple[int, int, int, int]
+    block_no: int
+    line_no: int
+    word_no: int
+
+
+@dataclass(frozen=True)
+class OcrLine:
+    text: str
+    confidence: float
+    bbox: tuple[int, int, int, int]
+    words: tuple[OcrWord, ...]
+
+
+@dataclass(frozen=True)
+class OcrBlock:
+    text: str
+    confidence: float
+    bbox: tuple[int, int, int, int]
+    lines: tuple[OcrLine, ...]
+
+
+@dataclass(frozen=True)
+class TesseractOcrCandidate:
+    language: str
+    psm: str
+    text: str
+    blocks: tuple[OcrBlock, ...]
+    mean_confidence: float
+    low_confidence_lines: int
+    score: float
+
+
+@dataclass(frozen=True)
 class OcrFallbackPipelineResult:
     page_texts: list[str]
     weak_pages_before_pdfplumber: int
@@ -322,17 +375,45 @@ def _apply_korean_ocr_phrase_corrections(text: str) -> str:
         corrected = corrected.replace(source, target)
     return corrected
 
+def _apply_spaced_korean_form_corrections(text: str) -> str:
+    corrected = text
+    spaced_patterns: tuple[tuple[str, str], ...] = (
+        (r"사\s*업\s*자\s*등\s*록\s*[종중증]\s*명", "사업자등록증명"),
+        (r"사\s*업\s*자\s*등\s*록\s*번\s*호", "사업자등록번호"),
+        (r"대\s*표\s*자\s*성\s*명", "대표자성명"),
+        (r"사\s*업\s*장\s*소\s*재\s*지", "사업장소재지"),
+        (r"정\s*보\s*통\s*신\s*업", "정보통신업"),
+        (r"소\s*매\s*[업엽]", "소매업"),
+        (r"공\s*[금급]\s*[업엽]", "공급업"),
+        (r"컴\s*퓨\s*터", "컴퓨터"),
+        (r"부\s*평\s*대\s*로\s*167\s*번\s*길", "부평대로167번길"),
+        (r"프\s*로\s*그\s*래\s*밍", "프로그래밍"),
+        (r"해\s*[탕당]\s*사\s*항", "해당사항"),
+        (r"증\s*명\s*합니다", "증명합니다"),
+        (r"폰\s*스\s*링\s*크", "폰스링크"),
+        (r"홈\s*택\s*스", "홈택스"),
+        (r"문\s*서\s*발\s*급\s*번\s*호", "문서발급번호"),
+    )
+    for pattern, target in spaced_patterns:
+        corrected = re.sub(pattern, target, corrected)
+    return corrected
+
+
 def _cleanup_korean_form_line(line: str) -> str:
     cleaned = line.strip()
     if not cleaned:
         return ""
+    cleaned = _apply_spaced_korean_form_corrections(cleaned)
     cleaned = re.sub(r"^(사업자등록증명)\s*[|｜].*$", r"\1", cleaned)
     cleaned = re.sub(r"92030\s+1", "920301", cleaned)
     cleaned = re.sub(r"(?<!\d)2095년(?=\s*12월)", "2025년", cleaned)
     cleaned = re.sub(r"(?<!\d)20254(?=\s*12월)", "2025년", cleaned)
     cleaned = re.sub(r"(?<=2025년\s)12[%21ㅣlI]+(?=\s*0[69]일)", "12월", cleaned)
-    if "부평대로167번길" in cleaned and "403호" in cleaned:
-        cleaned = re.sub(r"(?<=\s)45(?=\s+403호)", "4동", cleaned)
+    if "부평대로167번길" in cleaned and ("403호" in cleaned or "403 호" in cleaned):
+        cleaned = re.sub(r"(?<=\s)45(?=\s+403\s*호)", "4동", cleaned)
+        cleaned = re.sub(r"403\s+호", "403호", cleaned)
+    cleaned = re.sub(r"(?<=,\s)45(?=\s+403\s*호)", "4동", cleaned)
+    cleaned = re.sub(r"403\s+호", "403호", cleaned)
     if "hometax.go.kr" in cleaned:
         cleaned = re.sub(r"국세청\s+\S*\(hometax\.go\.kr\)?M?", "국세청 홈택스(hometax.go.kr)", cleaned)
         cleaned = cleaned.replace("발금번호", "발급번호")
@@ -345,10 +426,13 @@ def _cleanup_korean_form_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _normalize_page_text(text: str) -> str:
+def _normalize_page_text(text: str, *, profile: str | None = None) -> str:
     lines = [line.rstrip() for line in text.splitlines()]
     normalized = "\n".join(lines).strip()
-    return _cleanup_korean_form_text(_apply_korean_ocr_phrase_corrections(normalized))
+    resolved_profile = _active_ocr_profile if profile is None else profile
+    if resolved_profile == OCR_PROFILE_KOREAN_PUBLIC_DOCUMENT:
+        return _cleanup_korean_form_text(_apply_korean_ocr_phrase_corrections(normalized))
+    return normalized
 
 
 def _is_hangul_char(character: str) -> bool:
@@ -1253,6 +1337,149 @@ def _tesseract_variant_preference_score(languages: str, psm: str) -> float:
         score += 0.02
     return score
 
+def _parse_tesseract_confidence(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        return -1.0
+    return parsed
+
+
+def _merge_word_bbox(words: tuple[OcrWord, ...]) -> tuple[int, int, int, int]:
+    return (
+        min(word.bbox[0] for word in words),
+        min(word.bbox[1] for word in words),
+        max(word.bbox[2] for word in words),
+        max(word.bbox[3] for word in words),
+    )
+
+
+def _parse_tesseract_tsv(tsv_text: str) -> tuple[OcrBlock, ...]:
+    rows = [line.split("\t") for line in tsv_text.splitlines() if line.strip()]
+    if not rows:
+        return ()
+    header = rows[0]
+    column_index = {name: index for index, name in enumerate(header)}
+    required = {"level", "block_num", "line_num", "word_num", "left", "top", "width", "height", "conf", "text"}
+    if not required.issubset(column_index):
+        return ()
+
+    line_words: dict[tuple[int, int], list[OcrWord]] = {}
+    for row in rows[1:]:
+        if len(row) < len(header):
+            row.extend([""] * (len(header) - len(row)))
+        level = row[column_index["level"]]
+        if level != "5":
+            continue
+        text = row[column_index["text"]].strip()
+        confidence = _parse_tesseract_confidence(row[column_index["conf"]])
+        if not text or confidence < 0:
+            continue
+        try:
+            left = int(float(row[column_index["left"]]))
+            top = int(float(row[column_index["top"]]))
+            width = int(float(row[column_index["width"]]))
+            height = int(float(row[column_index["height"]]))
+            block_no = int(float(row[column_index["block_num"]]))
+            line_no = int(float(row[column_index["line_num"]]))
+            word_no = int(float(row[column_index["word_num"]]))
+        except ValueError:
+            continue
+        word = OcrWord(
+            text=text,
+            confidence=confidence,
+            bbox=(left, top, left + width, top + height),
+            block_no=block_no,
+            line_no=line_no,
+            word_no=word_no,
+        )
+        line_words.setdefault((block_no, line_no), []).append(word)
+
+    block_lines: dict[int, list[OcrLine]] = {}
+    for (block_no, _line_no), words_for_line in line_words.items():
+        ordered_words = tuple(sorted(words_for_line, key=lambda word: (word.bbox[0], word.word_no)))
+        if not ordered_words:
+            continue
+        line = OcrLine(
+            text=" ".join(word.text for word in ordered_words),
+            confidence=sum(word.confidence for word in ordered_words) / len(ordered_words),
+            bbox=_merge_word_bbox(ordered_words),
+            words=ordered_words,
+        )
+        block_lines.setdefault(block_no, []).append(line)
+
+    blocks: list[OcrBlock] = []
+    for block_no, lines_for_block in block_lines.items():
+        ordered_lines = tuple(sorted(lines_for_block, key=lambda line: (line.bbox[1], line.bbox[0])))
+        if not ordered_lines:
+            continue
+        block_words = tuple(word for line in ordered_lines for word in line.words)
+        block_text = "\n".join(line.text for line in ordered_lines)
+        blocks.append(
+            OcrBlock(
+                text=block_text,
+                confidence=sum(line.confidence for line in ordered_lines) / len(ordered_lines),
+                bbox=_merge_word_bbox(block_words),
+                lines=ordered_lines,
+            )
+        )
+    return tuple(sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0])))
+
+
+def _render_tesseract_blocks(blocks: tuple[OcrBlock, ...]) -> str:
+    lines = [line.text for block in blocks for line in block.lines if line.text.strip()]
+    return "\n".join(_clean_ocr_lines(lines))
+
+
+def _score_tesseract_blocks(blocks: tuple[OcrBlock, ...], text: str) -> tuple[float, int]:
+    lines = [line for block in blocks for line in block.lines]
+    if not lines:
+        return 0.0, 0
+    mean_confidence = sum(line.confidence for line in lines) / len(lines)
+    low_confidence_lines = sum(1 for line in lines if line.confidence < OCR_TESSERACT_MIN_LINE_CONFIDENCE)
+    return mean_confidence, low_confidence_lines
+
+
+def _run_tesseract_candidate(image_path: Path, languages: str, psm: str) -> TesseractOcrCandidate | None:
+    completed = subprocess.run(
+        [
+            "tesseract",
+            str(image_path),
+            "stdout",
+            "-l",
+            languages,
+            "--psm",
+            psm,
+            "--oem",
+            "1",
+            "-c",
+            "preserve_interword_spaces=1",
+            "tsv",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None
+    blocks = _parse_tesseract_tsv(completed.stdout)
+    text = _normalize_page_text(_render_tesseract_blocks(blocks))
+    if not text:
+        return None
+    mean_confidence, low_confidence_lines = _score_tesseract_blocks(blocks, text)
+    score = _compute_page_quality_score(text) + (mean_confidence / 100.0) * 0.12
+    score += _tesseract_variant_preference_score(languages, psm)
+    return TesseractOcrCandidate(
+        language=languages,
+        psm=psm,
+        text=text,
+        blocks=blocks,
+        mean_confidence=mean_confidence,
+        low_confidence_lines=low_confidence_lines,
+        score=score,
+    )
+
 
 def _prepare_tesseract_image(image: object) -> object:
     convert_method = getattr(image, "convert", None)
@@ -1383,8 +1610,7 @@ def _build_tesseract_ocr_extractor(
         if not callable(save_method):
             return ""
 
-        best_text = ""
-        best_selection_score = 0.0
+        best_candidate: TesseractOcrCandidate | None = None
         with tempfile.TemporaryDirectory(prefix="pdf_to_md_tesseract_") as temp_dir:
             image_path = Path(temp_dir) / "page.png"
             prepared_image = _prepare_tesseract_image(image)
@@ -1392,37 +1618,25 @@ def _build_tesseract_ocr_extractor(
             cast(Callable[..., object], prepared_save_method)(str(image_path), format="PNG")
 
             for languages, psm in variants:
-                completed = subprocess.run(
-                    [
-                        "tesseract",
-                        str(image_path),
-                        "stdout",
-                        "-l",
-                        languages,
-                        "--psm",
-                        psm,
-                        "--oem",
-                        "1",
-                        "-c",
-                        "preserve_interword_spaces=1",
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                )
-                if completed.returncode != 0 or not completed.stdout.strip():
+                candidate = _run_tesseract_candidate(image_path, languages, psm)
+                if candidate is None:
                     continue
-                candidate_text = _normalize_page_text(completed.stdout)
-                candidate_score = _compute_page_quality_score(candidate_text)
-                selection_score = candidate_score + _tesseract_variant_preference_score(languages, psm)
-                if selection_score > best_selection_score:
-                    best_text = candidate_text
-                    best_selection_score = selection_score
-                if best_selection_score >= OCR_TESSERACT_EARLY_ACCEPT_SCORE:
+                if best_candidate is None or candidate.score > best_candidate.score:
+                    best_candidate = candidate
+                if best_candidate.score >= OCR_TESSERACT_EARLY_ACCEPT_SCORE:
                     break
 
-        return best_text
+        if best_candidate is None:
+            return ""
+        _write_stderr_line(
+            "Diagnostics: mode=tesseract_candidate "
+            f"selected=true language={best_candidate.language} psm={best_candidate.psm} "
+            f"mean_confidence={best_candidate.mean_confidence:.1f} "
+            f"low_confidence_lines={best_candidate.low_confidence_lines} "
+            f"score={best_candidate.score:.3f}"
+        )
+        return best_candidate.text
+
 
     return _extract
 
@@ -2228,6 +2442,7 @@ def _run_split_before_ocr_conversion(
     ocr_layout: str,
     ocr_classical_zh_postprocess: bool,
     ocr_key_content_fallback: bool,
+    ocr_profile: str = OCR_PROFILE_NONE,
     zh_script: str = ZH_SCRIPT_KEEP,
     split_ocr_parallel: bool = False,
     workers: int | None = None,
@@ -2288,6 +2503,7 @@ def _run_split_before_ocr_conversion(
                     "ocr_classical_zh_postprocess_arg": ocr_classical_zh_postprocess,
                     "ocr_key_content_fallback_arg": ocr_key_content_fallback,
                     "zh_script_arg": zh_script,
+                    "ocr_profile_arg": ocr_profile,
                     "max_pages_arg": None,
                     "split_preset_arg": None,
                     "split_every_arg": None,
@@ -2948,6 +3164,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Hint OCR reading order: auto, vertical (right-to-left columns), or horizontal.",
     )
     _ = parser.add_argument(
+        "--ocr-profile",
+        default=OCR_PROFILE_NONE,
+        choices=OCR_PROFILE_CHOICES,
+        help="Optional document profile for profile-specific OCR cleanup.",
+    )
+    _ = parser.add_argument(
         "--ocr-classical-zh-postprocess",
         action="store_true",
         help="Apply conservative phrase-level corrections for historical/classical Chinese OCR output.",
@@ -3231,6 +3453,7 @@ def _execute_conversion(
     ocr_classical_zh_postprocess_arg: bool,
     ocr_key_content_fallback_arg: bool,
     zh_script_arg: str,
+    ocr_profile_arg: str,
     max_pages_arg: int | None,
     split_preset_arg: int | None,
     split_every_arg: int | None,
@@ -3241,7 +3464,7 @@ def _execute_conversion(
     resolved_ocr_mode: str,
     progress_format_arg: str = PROGRESS_FORMAT_TEXT,
 ) -> int:
-    global _active_progress_format
+    global _active_progress_format, _active_ocr_profile
 
     ocr_auto_mode_enabled = ocr_mode_arg == OCR_MODE_AUTO
     ocr_fallback_enabled = ocr_fallback_arg or ocr_auto_mode_enabled
@@ -3252,6 +3475,12 @@ def _execute_conversion(
             f"Invalid progress format `{progress_format_arg}`. "
             f"Choose one of: {', '.join(PROGRESS_FORMAT_CHOICES)}"
         )
+    if ocr_profile_arg not in OCR_PROFILE_CHOICES:
+        raise RuntimeError(
+            f"Invalid OCR profile `{ocr_profile_arg}`. "
+            f"Choose one of: {', '.join(OCR_PROFILE_CHOICES)}"
+        )
+
 
     input_pdf = Path(input_pdf_arg)
     output_path = (
@@ -3290,6 +3519,8 @@ def _execute_conversion(
 
     previous_progress_format = _active_progress_format
     _active_progress_format = progress_format_arg
+    previous_ocr_profile = _active_ocr_profile
+    _active_ocr_profile = ocr_profile_arg
     conversion_started_at = time.monotonic()
     stage_seconds: dict[str, float] = {
         "native": 0.0,
@@ -3333,6 +3564,7 @@ def _execute_conversion(
                 ocr_classical_zh_postprocess=ocr_classical_zh_postprocess_arg,
                 ocr_key_content_fallback=ocr_key_content_fallback_arg,
                 zh_script=zh_script_arg,
+                ocr_profile=ocr_profile_arg,
                 split_ocr_parallel=split_ocr_parallel_arg,
                 workers=workers_arg,
                 resource_guard_timeout_seconds=resource_guard_timeout_seconds_arg,
@@ -3543,6 +3775,7 @@ def _execute_conversion(
         return 1
     finally:
         _active_progress_format = previous_progress_format
+        _active_ocr_profile = previous_ocr_profile
 
     return 0
 
@@ -3568,6 +3801,7 @@ def main(argv: list[str] | None = None) -> int:
         getattr(args, "ocr_key_content_fallback", False)
     )
     zh_script_arg = getattr(args, "zh_script", ZH_SCRIPT_KEEP)
+    ocr_profile_arg = getattr(args, "ocr_profile", OCR_PROFILE_NONE)
     max_pages_arg = getattr(args, "max_pages", None)
     workers_arg = getattr(args, "workers", None)
     resource_guard_policy_arg = getattr(
@@ -3645,6 +3879,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if resource_guard_policy_arg not in _RESOURCE_GUARD_POLICY_CHOICES:
         _write_stderr_line("Invalid resource guard policy argument.")
+        return 1
+    if not isinstance(ocr_profile_arg, str) or ocr_profile_arg not in OCR_PROFILE_CHOICES:
+        _write_stderr_line("Invalid OCR profile argument.")
         return 1
     if not isinstance(resource_guard_timeout_seconds_arg, (int, float)):
         _write_stderr_line("Invalid resource guard timeout argument.")
@@ -3734,6 +3971,7 @@ def main(argv: list[str] | None = None) -> int:
         ocr_classical_zh_postprocess_arg=ocr_classical_zh_postprocess_arg,
         ocr_key_content_fallback_arg=ocr_key_content_fallback_arg,
         zh_script_arg=zh_script_arg,
+        ocr_profile_arg=ocr_profile_arg,
         max_pages_arg=max_pages_arg,
         split_preset_arg=split_preset_arg,
         split_every_arg=split_every_arg,
