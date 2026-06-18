@@ -128,7 +128,7 @@ OCR_PAGE_SCORE_FALLBACK_FLOOR = 0.10
 OCR_CLASSICAL_ZH_AGGRESSIVE_SCORE_THRESHOLD = 0.32
 OCR_KEY_CONTENT_MAX_LINES = 5
 OCR_KEY_CONTENT_MIN_PAGE_SCORE = 0.25
-OCR_TESSERACT_MIN_WORD_CONFIDENCE = 40.0
+OCR_TESSERACT_MIN_WORD_CONFIDENCE = 10.0
 OCR_TESSERACT_MIN_LINE_CONFIDENCE = 48.0
 OCR_WEAK_PAGE_PRESET_DPIS: tuple[int, ...] = (OCR_MAX_DPI, 300)
 OCR_SHORT_CJK_FRAGMENT_WHITELIST: frozenset[str] = frozenset(
@@ -1445,7 +1445,7 @@ def _parse_tesseract_tsv(tsv_text: str) -> tuple[OcrBlock, ...]:
             continue
         text = row[column_index["text"]].strip()
         confidence = _parse_tesseract_confidence(row[column_index["conf"]])
-        if not text or confidence < 0:
+        if not text or confidence < OCR_TESSERACT_MIN_WORD_CONFIDENCE:
             continue
         try:
             left = int(float(row[column_index["left"]]))
@@ -1749,6 +1749,104 @@ def _prepare_tesseract_image(image: object) -> object:
         return image
 
 
+
+def _bbox_overlap_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    overlap_left = max(a[0], b[0])
+    overlap_top = max(a[1], b[1])
+    overlap_right = min(a[2], b[2])
+    overlap_bottom = min(a[3], b[3])
+    if overlap_left >= overlap_right or overlap_top >= overlap_bottom:
+        return 0.0
+    overlap_area = (overlap_right - overlap_left) * (overlap_bottom - overlap_top)
+    a_area = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    b_area = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+    return overlap_area / min(a_area, b_area)
+
+
+def _line_quality_score(line: OcrLine) -> float:
+    text = line.text.strip()
+    if not text:
+        return 0.0
+    alpha_chars = sum(1 for c in text if c.isalpha())
+    cjk_chars = sum(1 for c in text if _is_cjk_or_hangul_char(c))
+    total_visible = len(text.replace(" ", ""))
+    if total_visible == 0:
+        return 0.0
+    alpha_ratio = alpha_chars / total_visible
+    cjk_ratio = cjk_chars / total_visible
+    quality = line.confidence / 100.0
+    if alpha_ratio > 0.7 and cjk_ratio < 0.1 and len(text) <= 3:
+        quality *= 0.3
+    if len(text) == 1 and text.isalpha():
+        quality *= 0.2
+    return quality
+
+def _vote_ocr_candidates(candidates: list[TesseractOcrCandidate]) -> TesseractOcrCandidate:
+    if len(candidates) == 1:
+        return candidates[0]
+
+    best_by_score = max(candidates, key=lambda c: c.score)
+    if best_by_score.mean_confidence >= 80.0 and best_by_score.low_confidence_lines <= 1:
+        return best_by_score
+
+    all_lines: list[tuple[OcrLine, int]] = []
+    for candidate_idx, candidate in enumerate(candidates):
+        for block in candidate.blocks:
+            for line in block.lines:
+                if line.text.strip():
+                    all_lines.append((line, candidate_idx))
+
+    if not all_lines:
+        return best_by_score
+
+    line_groups: list[list[tuple[OcrLine, int]]] = []
+    used: set[int] = set()
+    for idx, (line, cand_idx) in enumerate(all_lines):
+        if idx in used:
+            continue
+        group = [(line, cand_idx)]
+        used.add(idx)
+        for other_idx, (other_line, other_cand_idx) in enumerate(all_lines):
+            if other_idx in used:
+                continue
+            if _bbox_overlap_ratio(line.bbox, other_line.bbox) >= 0.4:
+                group.append((other_line, other_cand_idx))
+                used.add(other_idx)
+        line_groups.append(group)
+
+    best_lines: list[OcrLine] = []
+    for group in line_groups:
+        best_entry = max(group, key=lambda entry: _line_quality_score(entry[0]))
+        best_lines.append(best_entry[0])
+
+    best_lines.sort(key=lambda line: (line.bbox[1], line.bbox[0]))
+
+    merged_blocks: list[OcrBlock] = []
+    if best_lines:
+        block_words = tuple(word for line in best_lines for word in line.words)
+        merged_blocks.append(
+            OcrBlock(
+                text="\n".join(line.text for line in best_lines),
+                confidence=sum(line.confidence for line in best_lines) / len(best_lines),
+                bbox=_merge_word_bbox(block_words) if block_words else (0, 0, 0, 0),
+                lines=tuple(best_lines),
+            )
+        )
+
+    merged_text = _render_tesseract_blocks(tuple(merged_blocks))
+    mean_conf, low_conf, preview = _score_tesseract_blocks(tuple(merged_blocks), merged_text)
+    score = _compute_page_quality_score(merged_text) + (mean_conf / 100.0) * 0.12
+
+    return TesseractOcrCandidate(
+        language=best_by_score.language,
+        psm=best_by_score.psm,
+        text=merged_text,
+        blocks=tuple(merged_blocks),
+        mean_confidence=mean_conf,
+        low_confidence_lines=low_conf,
+        low_confidence_preview=preview,
+        score=score,
+    )
 def _build_tesseract_ocr_extractor(
     layout_mode: str = OCR_LAYOUT_AUTO,
 ) -> _ImageToString:
@@ -1769,7 +1867,7 @@ def _build_tesseract_ocr_extractor(
         if not callable(save_method):
             return ""
 
-        best_candidate: TesseractOcrCandidate | None = None
+        candidates: list[TesseractOcrCandidate] = []
         with tempfile.TemporaryDirectory(prefix="pdf_to_md_tesseract_") as temp_dir:
             image_path = Path(temp_dir) / "page.png"
             prepared_image = _prepare_tesseract_image(image)
@@ -1780,26 +1878,30 @@ def _build_tesseract_ocr_extractor(
                 candidate = _run_tesseract_candidate(image_path, languages, psm)
                 if candidate is None:
                     continue
-                if best_candidate is None or candidate.score > best_candidate.score:
-                    best_candidate = candidate
-                if best_candidate.score >= OCR_TESSERACT_EARLY_ACCEPT_SCORE:
-                    break
+                candidates.append(candidate)
 
-        if best_candidate is None:
+        if not candidates:
             return ""
+
+        if len(candidates) == 1:
+            best = candidates[0]
+        else:
+            best = _vote_ocr_candidates(candidates)
+
         preview = " | ".join(
             snippet.replace("\n", " ").replace("|", "/")
-            for snippet in best_candidate.low_confidence_preview
+            for snippet in best.low_confidence_preview
         )
         _write_stderr_line(
             "Diagnostics: mode=tesseract_candidate "
-            f"selected=true language={best_candidate.language} psm={best_candidate.psm} "
-            f"mean_confidence={best_candidate.mean_confidence:.1f} "
-            f"low_confidence_lines={best_candidate.low_confidence_lines} "
+            f"selected=true language={best.language} psm={best.psm} "
+            f"candidates_used={len(candidates)} "
+            f"mean_confidence={best.mean_confidence:.1f} "
+            f"low_confidence_lines={best.low_confidence_lines} "
             f"low_confidence_preview={preview or 'none'} "
-            f"score={best_candidate.score:.3f}"
+            f"score={best.score:.3f}"
         )
-        return best_candidate.text
+        return best.text
 
 
     return _extract
